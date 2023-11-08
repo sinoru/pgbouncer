@@ -98,8 +98,8 @@ jobs:
           flavor: |
             latest=auto
           tags: |
-            type=edge,branch=musubi.moe/main
-            type=edge,branch=musubi.moe/develop
+            type=edge,branch=sinoru/main
+            type=edge,branch=sinoru/develop
             type=semver,pattern={{raw}}
             type=ref,event=pr
       - name: Create manifest list and push
