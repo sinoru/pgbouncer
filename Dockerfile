@@ -60,5 +60,7 @@ RUN /usr/local/bin/pgbouncer --help
 
 USER pgbouncer
 ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["/usr/local/bin/pgbouncer"]
+STOPSIGNAL SIGINT
 EXPOSE 6432
+
+CMD ["/usr/local/bin/pgbouncer"]
