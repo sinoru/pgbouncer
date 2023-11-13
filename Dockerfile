@@ -43,7 +43,12 @@ RUN set -eux; \
     git submodule update --init; \
     ./autogen.sh; \
     ./configure \
-        --prefix=/usr/local \
+        --prefix=/ \
+        --exec-prefix=/usr/local \
+        --includedir=/usr/local/include \
+        --datarootdir=/usr/local/share \
+        --disable-evdns \
+        --with-pam \
         --with-cares \
     ; \
     make; \
