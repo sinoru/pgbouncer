@@ -8,7 +8,6 @@ RUN \
         ca-certificates \
         c-ares \
         libevent \
-        linux-pam \
         openssl \
         readline \
     ;
@@ -30,7 +29,6 @@ RUN \
         libevent-dev \
         libtool \
         linux-headers \
-        linux-pam-dev \
         m4 \
         openssl-dev \
         pandoc-cli \
@@ -54,7 +52,6 @@ RUN set -eux; \
         --includedir=/usr/local/include \
         --datarootdir=/usr/local/share \
         --disable-evdns \
-        --with-pam \
         --with-cares \
     ; \
     make; \
@@ -81,7 +78,6 @@ RUN set -eux; \
         --includedir=/usr/local/include \
         --datarootdir=/usr/local/share \
         --without-icu \
-        --with-pam \
         --without-zlib \
     ; \
     make -C src/bin install; \
