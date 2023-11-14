@@ -60,6 +60,7 @@ RUN set -eux; \
     make; \
     make install; \
     rm -rf \
+        /usr/local/lib/perl* \
         /usr/local/share/perl* \
     ;
 
@@ -87,6 +88,8 @@ RUN set -eux; \
     make -C src/interfaces install; \
     make -C doc install; \
     rm -rf \
+        /usr/local/bin/initdb \
+        /usr/local/bin/pg_ctl \
         /usr/local/include \
         /usr/local/lib/*.a \
         /usr/local/lib/perl* \
