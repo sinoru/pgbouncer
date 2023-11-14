@@ -25,28 +25,22 @@ RUN \
         autoconf \
         automake \
         build-base \
+        c-ares-dev \
+        git \
+        libevent-dev \
         libtool \
         linux-headers \
         linux-pam-dev \
+        m4 \
         openssl-dev \
+        pandoc-cli \
         pkgconfig \
+        readline-dev \
     ;
 
 ################################################################################
 
 FROM builder-base AS pgbouncer-builder
-
-RUN \
-    --mount=type=cache,target=/var/cache,sharing=locked \
-    --mount=type=tmpfs,target=/var/log \
-    set -eux; \
-    apk add --no-cache \
-        c-ares-dev \
-        git \
-        libevent-dev \
-        m4 \
-        pandoc-cli \
-    ;
 
 WORKDIR /opt/pgbouncer
 COPY --link . /opt/pgbouncer
@@ -72,14 +66,6 @@ RUN set -eux; \
 ################################################################################
 
 FROM builder-base AS psql-builder
-
-RUN \
-    --mount=type=cache,target=/var/cache,sharing=locked \
-    --mount=type=tmpfs,target=/var/log \
-    set -eux; \
-    apk add --no-cache \
-        readline-dev \
-    ;
 
 WORKDIR /opt/postgresql
 
