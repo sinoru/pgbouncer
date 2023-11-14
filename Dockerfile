@@ -5,18 +5,16 @@ RUN \
     --mount=type=tmpfs,target=/var/log \
     set -eux; \
     apk add --no-cache \
+        ca-certificates \
         c-ares \
         libevent \
         openssl \
-        tini \
+        readline \
     ;
-
-RUN set -eux; \
-    adduser -SHD pgbouncer;
 
 ################################################################################
 
-FROM base AS builder
+FROM base AS builder-base
 
 RUN \
     --mount=type=cache,target=/var/cache,sharing=locked \
@@ -30,11 +28,17 @@ RUN \
         git \
         libevent-dev \
         libtool \
+        linux-headers \
         m4 \
         openssl-dev \
         pandoc-cli \
         pkgconfig \
+        readline-dev \
     ;
+
+################################################################################
+
+FROM builder-base AS pgbouncer-builder
 
 WORKDIR /opt/pgbouncer
 COPY --link . /opt/pgbouncer
@@ -48,20 +52,71 @@ RUN set -eux; \
         --includedir=/usr/local/include \
         --datarootdir=/usr/local/share \
         --disable-evdns \
-        --with-pam \
         --with-cares \
     ; \
     make; \
-    make install;
+    make install; \
+    rm -rf \
+        /usr/local/lib/perl* \
+        /usr/local/share/perl* \
+    ;
+
+################################################################################
+
+FROM builder-base AS psql-builder
+
+WORKDIR /opt/postgresql
+
+RUN set -eux; \
+    wget -q https://ftp.postgresql.org/pub/source/v16.1/postgresql-16.1.tar.bz2; \
+    wget -q https://ftp.postgresql.org/pub/source/v16.1/postgresql-16.1.tar.bz2.sha256; \
+    sha256sum -c postgresql-16.1.tar.bz2.sha256; \
+    tar -xjf postgresql-16.1.tar.bz2 --strip-components=1; \
+    ./configure \
+        --prefix=/ \
+        --exec-prefix=/usr/local \
+        --includedir=/usr/local/include \
+        --datarootdir=/usr/local/share \
+        --without-icu \
+        --without-zlib \
+    ; \
+    make -C src/bin install; \
+    make -C src/interfaces install; \
+    make -C doc install; \
+    rm -rf \
+        /usr/local/bin/initdb \
+        /usr/local/bin/pg_ctl \
+        /usr/local/include \
+        /usr/local/lib/*.a \
+        /usr/local/lib/perl* \
+        /usr/local/lib/pkgconfig \
+        /usr/local/share/doc \
+        /usr/local/share/perl* \
+        /usr/local/share/postgresql \
+    ;
 
 ################################################################################
 
 FROM base
 
-COPY --link --from=builder /usr/local /usr/local
+RUN \
+    --mount=type=cache,target=/var/cache,sharing=locked \
+    --mount=type=tmpfs,target=/var/log \
+    set -eux; \
+    apk add --no-cache \
+        tini \
+    ;
+
+RUN set -eux; \
+    adduser -SHD pgbouncer;
+
+COPY --link --from=psql-builder /usr/local /usr/local
+COPY --link --from=pgbouncer-builder /usr/local /usr/local
 
 # Smoke test
-RUN /usr/local/bin/pgbouncer --help
+RUN set -eux; \
+    /usr/local/bin/pgbouncer --help; \
+    /usr/local/bin/psql --help;
 
 USER pgbouncer
 ENTRYPOINT ["/sbin/tini", "--"]
