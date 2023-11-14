@@ -79,6 +79,7 @@ RUN set -eux; \
         --datarootdir=/usr/local/share \
         --without-icu \
         --without-zlib \
+        --with-openssl \
     ; \
     make -C src/bin install; \
     make -C src/interfaces install; \
