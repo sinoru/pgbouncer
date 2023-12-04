@@ -120,6 +120,7 @@ RUN set -eux; \
     /usr/local/bin/psql --help;
 
 USER pgbouncer
+ENV PATH /usr/local/bin:$PATH
 ENTRYPOINT ["/sbin/tini", "--"]
 STOPSIGNAL SIGINT
 EXPOSE 6432
