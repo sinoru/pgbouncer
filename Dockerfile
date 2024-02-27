@@ -1,10 +1,12 @@
 FROM alpine AS base
+ARG TARGETPLATFORM
 
 RUN \
-    --mount=type=cache,target=/var/cache,sharing=locked \
+    --mount=type=cache,id=$TARGETPLATFORM:/var/cache/apk,target=/var/cache/apk,sharing=locked \
+    --mount=type=cache,target=$TARGETPLATFORM:/var/cache,sharing=locked \
     --mount=type=tmpfs,target=/var/log \
     set -eux; \
-    apk add --no-cache \
+    apk adduser \
         ca-certificates \
         c-ares \
         libevent \
@@ -15,12 +17,14 @@ RUN \
 ################################################################################
 
 FROM base AS builder-base
+ARG TARGETPLATFORM
 
 RUN \
-    --mount=type=cache,target=/var/cache,sharing=locked \
+    --mount=type=cache,id=$TARGETPLATFORM:/var/cache/apk,target=/var/cache/apk,sharing=locked \
+    --mount=type=cache,target=$TARGETPLATFORM:/var/cache,sharing=locked \
     --mount=type=tmpfs,target=/var/log \
     set -eux; \
-    apk add --no-cache \
+    apk add \
         autoconf \
         automake \
         build-base \
@@ -99,12 +103,14 @@ RUN set -eux; \
 ################################################################################
 
 FROM base
+ARG TARGETPLATFORM
 
 RUN \
-    --mount=type=cache,target=/var/cache,sharing=locked \
+    --mount=type=cache,id=$TARGETPLATFORM:/var/cache/apk,target=/var/cache/apk,sharing=locked \
+    --mount=type=cache,target=$TARGETPLATFORM:/var/cache,sharing=locked \
     --mount=type=tmpfs,target=/var/log \
     set -eux; \
-    apk add --no-cache \
+    apk add \
         tini \
     ;
 
