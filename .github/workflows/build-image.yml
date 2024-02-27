@@ -35,6 +35,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: ${{ matrix.docker-platforms }}
