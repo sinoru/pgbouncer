@@ -6,7 +6,7 @@ RUN \
     --mount=type=cache,target=$TARGETPLATFORM:/var/cache,sharing=locked \
     --mount=type=tmpfs,target=/var/log \
     set -eux; \
-    apk adduser \
+    apk add \
         ca-certificates \
         c-ares \
         libevent \
