@@ -341,6 +341,70 @@ def test_auth_dbname_usage_global_setting(
 
 
 @pytest.mark.skipif("WINDOWS", reason="Windows does not have SIGHUP")
+def test_auth_query_database_setting(
+    bouncer,
+):
+    """
+    Check the pgbouncer can use auth_query in database section to get password
+    """
+
+    config = f"""
+        [databases]
+        postgres = auth_query='SELECT usename, passwd FROM pg_shadow where usename = $1'\
+            host={bouncer.pg.host} port={bouncer.pg.port}
+        [pgbouncer]
+        auth_query = SELECT 1
+        auth_user = pswcheck
+        stats_users = stats
+        listen_addr = {bouncer.host}
+        admin_users = pgbouncer
+        auth_type = md5
+        auth_file = {bouncer.auth_path}
+        listen_port = {bouncer.port}
+        logfile = {bouncer.log_path}
+        auth_dbname = postgres
+    """
+
+    with bouncer.run_with_config(config):
+        with bouncer.run_with_config(config):
+            bouncer.sql(
+                query="select version()",
+                user="stats",
+                password="stats",
+                dbname="postgres",
+            )
+
+    config = f"""
+        [databases]
+        postgres = auth_query='SELECT usename, substring(passwd,1,3) FROM pg_shadow where usename = $1'\
+            host={bouncer.pg.host} port={bouncer.pg.port}
+        [pgbouncer]
+        auth_query = SELECT usename, passwd FROM pg_shadow where usename = $1
+        auth_user = pswcheck
+        stats_users = stats
+        listen_addr = {bouncer.host}
+        admin_users = pgbouncer
+        auth_type = md5
+        auth_file = {bouncer.auth_path}
+        listen_port = {bouncer.port}
+        logfile = {bouncer.log_path}
+        auth_dbname = postgres
+    """
+
+    with bouncer.run_with_config(config):
+        with pytest.raises(
+            psycopg.OperationalError, match="password authentication failed"
+        ):
+            with bouncer.run_with_config(config):
+                bouncer.sql(
+                    query="select version()",
+                    user="stats",
+                    password="stats",
+                    dbname="postgres",
+                )
+
+
+@pytest.mark.skipif("WINDOWS", reason="Windows does not have SIGHUP")
 @pytest.mark.md5
 def test_auth_dbname_works_fine(
     bouncer,
@@ -411,3 +475,104 @@ def test_auth_dbname_works_fine(
         # The client connects to postgres DB that matches with autodb
         # pgbouncer must use postgres_authdb1, which is defined in [pgbouncer] section
         bouncer.test(user="stats", password="stats", dbname="postgres")
+
+
+def test_hba_leak(bouncer):
+    """
+    Don't actually check if HBA auth works, but check that it doesn't leak
+    memory when using the feature.
+    """
+    bouncer.write_ini(f"auth_type = hba")
+    bouncer.write_ini(f"auth_hba_file = hba_test.rules")
+
+    bouncer.admin("reload")
+
+    bouncer.write_ini(f"auth_type = trust")
+
+    bouncer.admin("reload")
+
+    bouncer.write_ini(f"auth_type = hba")
+
+    bouncer.admin("reload")
+    bouncer.admin("reload")
+
+
+async def test_change_server_password_reconnect(bouncer, pg):
+    bouncer.default_db = "p4"
+    bouncer.admin(f"set default_pool_size=1")
+    bouncer.admin(f"set pool_mode=transaction")
+    try:
+        # good password, opens connection
+        bouncer.test()
+        pg.sql("ALTER USER puser1 PASSWORD 'bar'")
+        # works fine because server connection is still open
+        bouncer.test()
+        with bouncer.transaction() as cur1:
+            # Claim the connection
+            cur1.execute("select 1")
+            # Because of our fast client closure on server auth failures (see
+            # kill_pool_logins), we should only have one connection failing at
+            # the postgres side. But we should still have 3 failing at the
+            # pgbouncer side.
+            with pg.log_contains(
+                r"password authentication failed", times=1
+            ), bouncer.log_contains(
+                r"closing because: password authentication failed for user", times=3
+            ):
+                result1 = bouncer.atest()
+                result2 = bouncer.atest()
+                result3 = bouncer.atest()
+
+                # Mark the old connection as dirty
+                bouncer.admin("reconnect")
+                # Trigger new connection creation
+                bouncer.admin(f"set default_pool_size=2")
+                with pytest.raises(
+                    psycopg.OperationalError, match="password authentication failed"
+                ):
+                    await result1
+                with pytest.raises(
+                    psycopg.OperationalError, match="password authentication failed"
+                ):
+                    await result2
+                with pytest.raises(
+                    psycopg.OperationalError, match="password authentication failed"
+                ):
+                    await result3
+    finally:
+        pg.sql("ALTER USER puser1 PASSWORD 'foo'")
+
+
+async def test_change_server_password_server_lifetime(bouncer, pg):
+    bouncer.default_db = "p4"
+    bouncer.admin(f"set default_pool_size=1")
+    bouncer.admin(f"set pool_mode=transaction")
+    bouncer.admin(f"set server_lifetime=1")
+    try:
+        # good password, opens connection
+        bouncer.test()
+        pg.sql("ALTER USER puser1 PASSWORD 'bar'")
+        # wait until server disconnect
+        time.sleep(3)
+
+        # Because of our fast client closure on server auth failures (see
+        # kill_pool_logins), we should only have one connection failing at
+        # the postgres side. But we should still have 3 failing at the
+        # pgbouncer side.
+        with pg.log_contains(
+            r"password authentication failed", times=1
+        ), bouncer.log_contains(
+            r"closing because: password authentication failed for user", times=3
+        ):
+            result1 = bouncer.atest()
+            result2 = bouncer.atest()
+            result3 = bouncer.atest()
+
+            with pytest.raises(psycopg.OperationalError):
+                await result1
+            with pytest.raises(psycopg.OperationalError):
+                await result2
+            with pytest.raises(psycopg.OperationalError):
+                await result3
+    finally:
+        pg.sql("ALTER USER puser1 PASSWORD 'foo'")

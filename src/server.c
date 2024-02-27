@@ -65,22 +65,37 @@ failed_store:
 	return false;
 }
 
-/* we cannot log in at all, notify clients */
+/*
+ * We cannot log in to the server at all. If we don't already have any usable
+ * server connections, we disconnect all other clients in the pool that are
+ * waiting for a server.
+ */
 void kill_pool_logins(PgPool *pool, const char *sqlstate, const char *msg)
 {
 	struct List *item, *tmp;
 	PgSocket *client;
+	/*
+	 * The check for welcome_msg_ready is necessary because that indicates
+	 * that the pool got tagged as dirty. It's possible that there's still
+	 * working server connections in that case, but as soon as they get
+	 * unassigned from their client they would be closed. So they don't
+	 * really count as usable anymore.
+	 */
+	if (pool_connected_server_count(pool) != 0 && pool->welcome_msg_ready)
+		return;
 
 	statlist_for_each_safe(item, &pool->waiting_client_list, tmp) {
 		client = container_of(item, PgSocket, head);
-		if (!client->wait_for_welcome)
-			continue;
-
 		disconnect_client_sqlstate(client, true, sqlstate, msg);
 	}
 }
 
-/* we cannot log in at all, notify clients with server error */
+/*
+ * We cannot log in to the server at all. If we don't already have any usable
+ * server connections, we disconnect all other clients in the pool that are
+ * also waiting for a server. We disconnect them with exactly the same error
+ * message and code as we received from the server.
+ */
 static void kill_pool_logins_server_error(PgPool *pool, PktHdr *errpkt)
 {
 	const char *level, *msg, *sqlstate;
@@ -133,10 +148,7 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
 		break;
 
 	case 'E':		/* ErrorResponse */
-		if (!server->pool->welcome_msg_ready)
-			kill_pool_logins_server_error(server->pool, pkt);
-		else
-			log_server_error("S: login failed", pkt);
+		kill_pool_logins_server_error(server->pool, pkt);
 
 		disconnect_server(server, true, "login failed");
 		break;
@@ -364,6 +376,27 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 			/* it's impossible to track sync count over copy */
 			if (client)
 				client->expect_rfq_count = 0;
+		}
+		/*
+		 * Clean up prepared statements if needed if the client sent a
+		 * DEALLOCATE ALL or a DISCARD ALL query. Not doing so would
+		 * confuse our prepared statement handling, because we would
+		 * expect certain queries to be prepared at the server that are
+		 * not.
+		 */
+		if (is_prepared_statements_enabled(server->pool)
+		    && (pkt->len == 1 + 4 + 15 || pkt->len == 1 + 4 + 12)) {	/* size of complete DEALLOCATE/DISCARD ALL */
+			const char *tag;
+			if (mbuf_get_string(&pkt->data, &tag)) {
+				if (strcmp(tag, "DEALLOCATE ALL") == 0 ||
+				    strcmp(tag, "DISCARD ALL") == 0) {
+					free_server_prepared_statements(server);
+					if (client)
+						free_client_prepared_statements(client);
+				}
+			} else {
+				return false;
+			}
 		}
 		pop_outstanding_request(server, "E", &ignore_packet);
 
@@ -690,6 +723,18 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
 		if (server->setting_vars) {
 			PgSocket *client = server->link;
 			Assert(client);
+
+			/*
+			 * It's possible that the client vars and server vars have
+			 * different string representations, but still Postgres did not
+			 * send a ParamaterStatus packet. This happens when the server
+			 * variable is the canonical version of the client variable, i.e.
+			 * they mean the same just written slightly different. To make sure
+			 * that the canonical version is also stored in the client, we now
+			 * copy the server variables over to the client variables.
+			 * See issue #776 for an example of this.
+			 */
+			varcache_set_canonical(server, client);
 
 			server->setting_vars = false;
 			log_noise("done setting vars unpausing client");

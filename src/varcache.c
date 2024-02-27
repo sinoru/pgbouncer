@@ -156,7 +156,7 @@ static int apply_var(PktBuf *pkt, const char *key,
 	const char *tmp;
 
 	/* if unset, skip */
-	if (!cval || !sval || !*cval->str)
+	if (!cval || !sval)
 		return 0;
 
 	/* if equal, skip */
@@ -230,6 +230,24 @@ bool varcache_apply(PgSocket *server, PgSocket *client, bool *changes_p)
 
 	slog_debug(server, "varcache_apply: %s", pkt->buf + sql_ofs);
 	return pktbuf_send_immediate(pkt, server);
+}
+
+void varcache_set_canonical(PgSocket *server, PgSocket *client)
+{
+	struct PStr *server_val, *client_val;
+	const struct var_lookup *lk, *tmp;
+
+	HASH_ITER(hh, lookup_map, lk, tmp) {
+		server_val = server->vars.var_list[lk->idx];
+		client_val = client->vars.var_list[lk->idx];
+		if (client_val && server_val && client_val != server_val) {
+			slog_debug(client, "varcache_set_canonical: setting %s to its canonical version %s -> %s",
+				   lk->name, client_val->str, server_val->str);
+			strpool_incref(server_val);
+			strpool_decref(client_val);
+			client->vars.var_list[lk->idx] = server_val;
+		}
+	}
 }
 
 void varcache_fill_unset(VarCache *src, PgSocket *dst)
