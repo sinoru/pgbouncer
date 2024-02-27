@@ -11,6 +11,7 @@ RUN \
         c-ares \
         libevent \
         libssl3 \
+        linux-pam \
     ;
 
 ################################################################################
@@ -31,6 +32,7 @@ RUN \
         libevent-dev \
         libtool \
         linux-headers \
+        linux-pam-dev \
         openssl-dev \
         pandoc-cli \
         pkgconfig \
