@@ -21,6 +21,7 @@
  */
 
 #include "bouncer.h"
+#include "usual/time.h"
 
 #include <usual/fileutil.h>
 #include <usual/string.h>
@@ -118,20 +119,6 @@ static char * cstr_get_pair(char *p,
 	log_noise("cstr_get_pair: \"%s\"=\"%s\"", *key_p, *val_p);
 
 	return cstr_skip_ws(p);
-}
-
-/*
- * Same as strcmp, but handles NULLs. If both sides are NULL, returns "true".
- */
-static bool strings_equal(const char *str_left, const char *str_right)
-{
-	if (str_left == NULL && str_right == NULL)
-		return true;
-
-	if (str_left == NULL || str_right == NULL)
-		return false;
-
-	return strcmp(str_left, str_right) == 0;
 }
 
 /*
@@ -266,6 +253,7 @@ bool parse_database(void *base, const char *name, const char *connstr)
 	int min_pool_size = -1;
 	int res_pool_size = -1;
 	int max_db_connections = -1;
+	usec_t server_lifetime = 0;
 	int dbname_ofs;
 	int pool_mode = POOL_INHERIT;
 
@@ -348,6 +336,8 @@ bool parse_database(void *base, const char *name, const char *connstr)
 			res_pool_size = atoi(val);
 		} else if (strcmp("max_db_connections", key) == 0) {
 			max_db_connections = atoi(val);
+		} else if (strcmp("server_lifetime", key) == 0) {
+			server_lifetime = atoi(val) * USEC;
 		} else if (strcmp("pool_mode", key) == 0) {
 			if (!cf_set_lookup(&cv, val)) {
 				log_error("invalid pool mode: %s", val);
@@ -390,11 +380,11 @@ bool parse_database(void *base, const char *name, const char *connstr)
 			changed = true;
 		} else if (port != db->port) {
 			changed = true;
-		} else if (username && !db->forced_user) {
+		} else if (username && !db->forced_user_credentials) {
 			changed = true;
-		} else if (username && strcmp(username, db->forced_user->name) != 0) {
+		} else if (username && strcmp(username, db->forced_user_credentials->name) != 0) {
 			changed = true;
-		} else if (!username && db->forced_user) {
+		} else if (!username && db->forced_user_credentials) {
 			changed = true;
 		} else if (!strings_equal(connect_query, db->connect_query)) {
 			changed = true;
@@ -415,6 +405,7 @@ bool parse_database(void *base, const char *name, const char *connstr)
 	db->res_pool_size = res_pool_size;
 	db->pool_mode = pool_mode;
 	db->max_db_connections = max_db_connections;
+	db->server_lifetime = server_lifetime;
 	free(db->connect_query);
 	db->connect_query = connect_query;
 
@@ -459,19 +450,19 @@ bool parse_database(void *base, const char *name, const char *connstr)
 	}
 
 	if (auth_username != NULL) {
-		db->auth_user = find_user(auth_username);
-		if (!db->auth_user) {
-			db->auth_user = add_user(auth_username, "");
+		db->auth_user_credentials = find_global_credentials(auth_username);
+		if (!db->auth_user_credentials) {
+			db->auth_user_credentials = add_global_credentials(auth_username, "");
 		}
-	} else if (db->auth_user) {
-		db->auth_user = NULL;
+	} else if (db->auth_user_credentials) {
+		db->auth_user_credentials = NULL;
 	}
 
 	/* if user is forced, create fake object for it */
 	if (username != NULL) {
-		if (!force_user(db, username, password))
+		if (!force_user_credentials(db, username, password))
 			log_warning("db setup failed, trying to continue");
-	} else if (db->forced_user) {
+	} else if (db->forced_user_credentials) {
 		log_warning("losing forced user not supported,"
 			    " keeping old setting");
 	}
@@ -489,9 +480,10 @@ fail:
 bool parse_user(void *base, const char *name, const char *connstr)
 {
 	char *p, *key, *val, *tmp_connstr;
-	PgUser *user;
+	PgGlobalUser *user;
 	struct CfValue cv;
 	int pool_mode = POOL_INHERIT;
+	int pool_size = -1;
 	int max_user_connections = -1;
 
 
@@ -519,6 +511,8 @@ bool parse_user(void *base, const char *name, const char *connstr)
 				log_error("invalid pool mode: %s", val);
 				goto fail;
 			}
+		} else if (strcmp("pool_size", key) == 0) {
+			pool_size = atoi(val);
 		} else if (strcmp("max_user_connections", key) == 0) {
 			max_user_connections = atoi(val);
 		} else {
@@ -527,9 +521,9 @@ bool parse_user(void *base, const char *name, const char *connstr)
 		}
 	}
 
-	user = find_user(name);
+	user = find_global_user(name);
 	if (!user) {
-		user = add_user(name, "");
+		user = add_global_user(name, "");
 		if (!user) {
 			log_error("cannot create user, no memory?");
 			goto fail;
@@ -537,6 +531,7 @@ bool parse_user(void *base, const char *name, const char *connstr)
 	}
 
 	user->pool_mode = pool_mode;
+	user->pool_size = pool_size;
 	user->max_user_connections = max_user_connections;
 
 	free(tmp_connstr);
@@ -577,18 +572,24 @@ static void copy_quoted(char *dst, const char *src, int len)
 	*dst = 0;
 }
 
-static void unquote_add_user(const char *username, const char *password)
+/* This function is only called when parsing the auth file, so
+   all users added by this function do not have a dynamic password,
+   by definition. If the password is empty, so be it. */
+static void unquote_add_authfile_user(const char *username, const char *password)
 {
 	char real_user[MAX_USERNAME];
 	char real_passwd[MAX_PASSWORD];
-	PgUser *user;
+	PgGlobalUser *user;
 
 	copy_quoted(real_user, username, sizeof(real_user));
 	copy_quoted(real_passwd, password, sizeof(real_passwd));
 
-	user = add_user(real_user, real_passwd);
-	if (!user)
+	user = add_global_user(real_user, real_passwd);
+	if (!user) {
 		log_warning("cannot create user, no memory");
+		return;
+	}
+	user->credentials.dynamic_passwd = false;
 }
 
 static bool auth_loaded(const char *fn)
@@ -630,12 +631,11 @@ bool loader_users_check(void)
 
 static void disable_users(void)
 {
-	PgUser *user;
 	struct List *item;
 
 	statlist_for_each(item, &user_list) {
-		user = container_of(item, PgUser, head);
-		user->passwd[0] = 0;
+		PgGlobalUser *user = container_of(item, PgGlobalUser, head);
+		user->credentials.passwd[0] = 0;
 	}
 }
 
@@ -706,7 +706,7 @@ bool load_auth_file(const char *fn)
 		*p++ = 0;	/* tag password end */
 
 		/* send them away */
-		unquote_add_user(user, password);
+		unquote_add_authfile_user(user, password);
 
 		/* skip rest of the line */
 		while (*p && *p != '\n') p++;

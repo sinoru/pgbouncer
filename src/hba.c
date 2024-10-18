@@ -24,41 +24,6 @@
 #include <usual/socket.h>
 #include <usual/string.h>
 
-enum RuleType {
-	RULE_LOCAL,
-	RULE_HOST,
-	RULE_HOSTSSL,
-	RULE_HOSTNOSSL,
-};
-
-#define NAME_ALL        1
-#define NAME_SAMEUSER   2
-
-struct NameSlot {
-	size_t strlen;
-	char str[];
-};
-
-struct HBAName {
-	unsigned int flags;
-	struct StrSet *name_set;
-};
-
-struct HBARule {
-	struct List node;
-	enum RuleType rule_type;
-	int rule_method;
-	int rule_af;
-	uint8_t rule_addr[16];
-	uint8_t rule_mask[16];
-	struct HBAName db_name;
-	struct HBAName user_name;
-};
-
-struct HBA {
-	struct List rules;
-};
-
 /*
  * StrSet
  */
@@ -345,6 +310,7 @@ static void free_parser(struct TokParser *p)
 }
 
 static bool parse_names(struct HBAName *hname, struct TokParser *p, bool is_db, const char *parent_filename);
+static bool parse_ident_name(const char **ident_name, struct TokParser *tp, bool *is_name_all);
 
 static bool parse_namefile(struct HBAName *hname, const char *fn, bool is_db)
 {
@@ -377,6 +343,22 @@ static bool parse_namefile(struct HBAName *hname, const char *fn, bool is_db)
 	return ok;
 }
 
+static bool parse_ident_name(const char **ident_name, struct TokParser *tp, bool *is_name_all)
+{
+	if (eat_kw(tp, "all")) {
+		*is_name_all = true;
+		return true;
+	}
+
+	if (!expect(tp, TOK_IDENT, ident_name)) {
+		if (!expect(tp, TOK_STRING, ident_name)) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
 static bool parse_names(struct HBAName *hname, struct TokParser *tp, bool is_db, const char *parent_filename)
 {
 	const char *tok;
@@ -399,8 +381,8 @@ static bool parse_names(struct HBAName *hname, struct TokParser *tp, bool is_db,
 				return false;
 			}
 			if (eat_kw(tp, "replication")) {
-				log_warning("replication is not supported");
-				return false;
+				hname->flags |= NAME_REPLICATION;
+				goto eat_comma;
 			}
 		}
 
@@ -455,19 +437,19 @@ static void rule_free(struct HBARule *rule)
 	free(rule);
 }
 
-static bool parse_addr(struct HBARule *rule, const char *addr)
+static bool parse_addr(struct HBAAddress *haddress, const char *addr)
 {
-	if (inet_pton(AF_INET6, addr, rule->rule_addr)) {
-		rule->rule_af = AF_INET6;
-	} else if (inet_pton(AF_INET, addr, rule->rule_addr)) {
-		rule->rule_af = AF_INET;
+	if (inet_pton(AF_INET6, addr, haddress->addr)) {
+		haddress->family = AF_INET6;
+	} else if (inet_pton(AF_INET, addr, haddress->addr)) {
+		haddress->family = AF_INET;
 	} else {
 		return false;
 	}
 	return true;
 }
 
-static bool parse_nmask(struct HBARule *rule, const char *nmask)
+static bool parse_nmask(struct HBAAddress *haddress, const char *nmask)
 {
 	char *end = NULL;
 	unsigned long bits;
@@ -477,29 +459,197 @@ static bool parse_nmask(struct HBARule *rule, const char *nmask)
 	if (errno || *end) {
 		return false;
 	}
-	if (rule->rule_af == AF_INET && bits > 32) {
+	if (haddress->family == AF_INET && bits > 32) {
 		return false;
 	}
-	if (rule->rule_af == AF_INET6 && bits > 128) {
+	if (haddress->family == AF_INET6 && bits > 128) {
 		return false;
 	}
 	for (i = 0; i < bits/8; i++)
-		rule->rule_mask[i] = 255;
+		haddress->mask[i] = 255;
 	if (bits % 8)
-		rule->rule_mask[i] = 255 << (8 - (bits % 8));
+		haddress->mask[i] = 255 << (8 - (bits % 8));
 	return true;
 }
 
-static bool bad_mask(struct HBARule *rule)
+static bool bad_mask(struct HBAAddress *haddress)
 {
-	int i, bytes = rule->rule_af == AF_INET ? 4 : 16;
+	int i, bytes = haddress->family == AF_INET ? 4 : 16;
 	uint8_t res = 0;
 	for (i = 0; i < bytes; i++)
-		res |= rule->rule_addr[i] & (255 ^ rule->rule_mask[i]);
+		res |= haddress->addr[i] & (255 ^ haddress->mask[i]);
 	return !!res;
 }
 
-static bool parse_line(struct HBA *hba, struct TokParser *tp, int linenr, const char *parent_filename)
+static bool match_map(struct HBARule *rule, struct Ident *ident, const char *mapname)
+{
+	struct List *el;
+	struct IdentMap *map;
+
+	if (!ident)
+		return false;
+
+	list_for_each(el, &ident->maps) {
+		map = container_of(el, struct IdentMap, node);
+
+		if (strcmp(map->map_name, mapname) == 0) {
+			rule->identmap = map;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool parse_map_definition(struct HBARule *rule, struct Ident *ident, struct TokParser *tp, int linenr)
+{
+	const char *str;
+	char *val;
+
+	if (!expect(tp, TOK_IDENT, &str))
+		return true;
+
+	val = strchr(str, '=');
+
+	if (val == NULL || strncmp(str, "map=", 4) != 0) {
+		log_warning("hba line %d: Ident map %s is malformed. It is not in map=value format.", linenr, str);
+		return false;
+	}
+
+	val++;
+
+	next_token(tp);
+
+	if (!match_map(rule, ident, val)) {
+		log_warning("hba line %d: Ident map %s is not found in ident config file", linenr, val);
+		return false;
+	}
+
+	return true;
+}
+static void mapping_free(struct Mapping *mapping)
+{
+	free(mapping->system_user_name);
+	free(mapping->postgres_user_name);
+	free(mapping);
+}
+
+static void ident_map_free(struct IdentMap *ident_map)
+{
+	struct List *el, *tmp;
+	struct Mapping *mapping;
+
+	if (!ident_map)
+		return;
+
+	list_for_each_safe(el, &ident_map->mappings, tmp) {
+		mapping = container_of(el, struct Mapping, node);
+		list_del(&mapping->node);
+		mapping_free(mapping);
+	}
+
+	free(ident_map->map_name);
+	free(ident_map);
+}
+
+static bool find_ident_map(struct Ident *ident, const char *mapname, struct IdentMap **ident_map)
+{
+	struct List *el;
+
+	list_for_each(el, &ident->maps) {
+		*ident_map = container_of(el, struct IdentMap, node);
+
+		if (!strcmp((*ident_map)->map_name, mapname))
+			return true;
+	}
+
+	return false;
+}
+
+static bool parse_ident_line(struct Ident *ident, struct TokParser *tp, int linenr)
+{
+	const char *map_name = NULL;
+	char *map_name_copy = NULL;
+	const char *system_user_name = NULL;
+	const char *postgres_user_name = NULL;
+	struct IdentMap *ident_map = NULL;
+	struct Mapping *mapping = NULL;
+
+	bool is_name_all = false;
+
+	if (eat(tp, TOK_EOL)) {
+		return true;
+	}
+
+	mapping = calloc(1, sizeof(*mapping));
+
+	if (!mapping) {
+		log_warning("ident: no mem for parsing mapping");
+		return false;
+	}
+
+	if (!expect(tp, TOK_IDENT, &map_name)) {
+		goto failed;
+	}
+
+	map_name_copy = strdup(map_name);
+
+	next_token(tp);
+
+	if (!expect(tp, TOK_IDENT, &system_user_name)) {
+		if (!expect(tp, TOK_STRING, &system_user_name))
+			goto failed;
+	}
+
+	mapping->system_user_name = strdup(system_user_name);
+
+	next_token(tp);
+
+
+	if (!parse_ident_name(&postgres_user_name, tp, &is_name_all)) {
+		goto failed;
+	}
+
+	if (is_name_all) {
+		mapping->name_flags |= NAME_ALL;
+	} else {
+		mapping->postgres_user_name = strdup(postgres_user_name);
+	}
+
+	next_token(tp);
+
+	if (!eat(tp, TOK_EOL)) {
+		log_warning("ident line %d: unsupported parameters", linenr);
+		goto failed;
+	}
+
+
+	if (find_ident_map(ident, map_name_copy, &ident_map)) {
+		list_append(&ident_map->mappings, &mapping->node);
+		free(map_name_copy);
+	} else {
+		ident_map = calloc(1, sizeof(*ident_map));
+
+		if (!ident_map) {
+			log_warning("ident: no mem for parsing ident_map");
+			return false;
+		}
+
+		ident_map->map_name = map_name_copy;
+		list_init(&ident_map->mappings);
+		list_append(&ident_map->mappings, &mapping->node);
+		list_append(&ident->maps, &ident_map->node);
+	}
+
+	return true;
+
+failed:
+	mapping_free(mapping);
+	ident_map_free(ident_map);
+	return false;
+}
+
+static bool parse_line(struct HBA *hba, struct Ident *ident, struct TokParser *tp, int linenr, const char *parent_filename)
 {
 	const char *addr = NULL, *mask = NULL;
 	enum RuleType rtype;
@@ -521,7 +671,7 @@ static bool parse_line(struct HBA *hba, struct TokParser *tp, int linenr, const 
 		return false;
 	}
 
-	rule = calloc(sizeof *rule, 1);
+	rule = calloc(1, sizeof(*rule));
 	if (!rule) {
 		log_warning("hba: no mem for rule");
 		return false;
@@ -534,7 +684,9 @@ static bool parse_line(struct HBA *hba, struct TokParser *tp, int linenr, const 
 		goto failed;
 
 	if (rtype == RULE_LOCAL) {
-		rule->rule_af = AF_UNIX;
+		rule->address.family = AF_UNIX;
+	} else if (eat_kw(tp, "all")) {
+		rule->address.flags |= ADDRESS_ALL;
 	} else {
 		if (!expect(tp, TOK_IDENT, &addr)) {
 			log_warning("hba line %d: did not find address - %d - '%s'", linenr, tp->cur_tok, tp->buf);
@@ -545,13 +697,13 @@ static bool parse_line(struct HBA *hba, struct TokParser *tp, int linenr, const 
 			*nmask++ = 0;
 		}
 
-		if (!parse_addr(rule, addr)) {
+		if (!parse_addr(&rule->address, addr)) {
 			log_warning("hba line %d: failed to parse address - %s", linenr, addr);
 			goto failed;
 		}
 
 		if (nmask) {
-			if (!parse_nmask(rule, nmask)) {
+			if (!parse_nmask(&rule->address, nmask)) {
 				log_warning("hba line %d: invalid mask", linenr);
 				goto failed;
 			}
@@ -562,17 +714,17 @@ static bool parse_line(struct HBA *hba, struct TokParser *tp, int linenr, const 
 				log_warning("hba line %d: did not find mask", linenr);
 				goto failed;
 			}
-			if (!inet_pton(rule->rule_af, mask, rule->rule_mask)) {
+			if (!inet_pton(rule->address.family, mask, rule->address.mask)) {
 				log_warning("hba line %d: failed to parse mask: %s", linenr, mask);
 				goto failed;
 			}
 			next_token(tp);
 		}
-		if (bad_mask(rule)) {
+		if (bad_mask(&rule->address)) {
 			char buf1[128], buf2[128];
 			log_warning("address does not match mask in %s line #%d: %s / %s", parent_filename, linenr,
-				    inet_ntop(rule->rule_af, rule->rule_addr, buf1, sizeof buf1),
-				    inet_ntop(rule->rule_af, rule->rule_mask, buf2, sizeof buf2));
+				    inet_ntop(rule->address.family, rule->address.addr, buf1, sizeof buf1),
+				    inet_ntop(rule->address.family, rule->address.mask, buf2, sizeof buf2));
 		}
 	}
 
@@ -595,11 +747,16 @@ static bool parse_line(struct HBA *hba, struct TokParser *tp, int linenr, const 
 		goto failed;
 	}
 
+	if (!parse_map_definition(rule, ident, tp, linenr)) {
+		goto failed;
+	}
+
 	if (!eat(tp, TOK_EOL)) {
 		log_warning("hba line %d: unsupported parameters", linenr);
 		goto failed;
 	}
 
+	rule->hba_linenr = linenr;
 	list_append(&hba->rules, &rule->node);
 	return true;
 failed:
@@ -607,7 +764,61 @@ failed:
 	return false;
 }
 
-struct HBA *hba_load_rules(const char *fn)
+struct Ident *ident_load_map(const char *fn)
+{
+	struct Ident *ident = NULL;
+	FILE *f = NULL;
+	char *ln = NULL;
+	size_t lnbuf = 0;
+	ssize_t len;
+	int linenr;
+
+	struct TokParser tp;
+
+	if (fn == NULL)
+		return NULL;
+
+	init_parser(&tp);
+
+	ident = malloc(sizeof *ident);
+
+	list_init(&ident->maps);
+
+	if (!ident)
+		goto out;
+
+	f = fopen(fn, "r");
+
+	if (!f) {
+		log_error("could not open ident config file %s: %s", fn, strerror(errno));
+		goto out;
+	}
+
+	for (linenr = 1; ; linenr++) {
+		len = getline(&ln, &lnbuf, f);
+		if (len < 0)
+			break;
+
+		parse_from_string(&tp, ln);
+
+		if (!parse_ident_line(ident, &tp, linenr)) {
+			/* Tell the admin where to look for the problem. */
+			log_warning("could not parse ident config line %d", linenr);
+			/* Ignore line, but parse to the end. */
+			continue;
+		}
+	}
+
+out:
+	free_parser(&tp);
+	free(ln);
+
+	if (f)
+		fclose(f);
+	return ident;
+}
+
+struct HBA *hba_load_rules(const char *fn, struct Ident *ident)
 {
 	struct HBA *hba = NULL;
 	FILE *f = NULL;
@@ -636,7 +847,7 @@ struct HBA *hba_load_rules(const char *fn)
 		if (len < 0)
 			break;
 		parse_from_string(&tp, ln);
-		if (!parse_line(hba, &tp, linenr, fn)) {
+		if (!parse_line(hba, ident, &tp, linenr, fn)) {
 			/* Tell the admin where to look for the problem. */
 			log_warning("could not parse hba config line %d", linenr);
 			/* Ignore line, but parse to the end. */
@@ -649,6 +860,22 @@ out:
 	if (f)
 		fclose(f);
 	return hba;
+}
+
+void ident_free(struct Ident *ident)
+{
+	struct List *el, *tmp;
+	struct IdentMap *map;
+
+	if (!ident)
+		return;
+
+	list_for_each_safe(el, &ident->maps, tmp) {
+		map = container_of(el, struct IdentMap, node);
+		list_del(&map->node);
+		ident_map_free(map);
+	}
+	free(ident);
 }
 
 void hba_free(struct HBA *hba)
@@ -676,30 +903,44 @@ static bool name_match(struct HBAName *hname, const char *name, unsigned int nam
 	return false;
 }
 
-static bool match_inet4(const struct HBARule *rule, PgAddr *addr)
+static bool match_inet4(const struct HBAAddress *haddress, PgAddr *addr)
 {
 	const uint32_t *src, *base, *mask;
 	if (pga_family(addr) != AF_INET)
 		return false;
 	src = (uint32_t *)&addr->sin.sin_addr.s_addr;
-	base = (uint32_t *)rule->rule_addr;
-	mask = (uint32_t *)rule->rule_mask;
+	base = (uint32_t *)haddress->addr;
+	mask = (uint32_t *)haddress->mask;
 	return (src[0] & mask[0]) == base[0];
 }
 
-static bool match_inet6(const struct HBARule *rule, PgAddr *addr)
+static bool match_inet6(const struct HBAAddress *haddress, PgAddr *addr)
 {
 	const uint32_t *src, *base, *mask;
 	if (pga_family(addr) != AF_INET6)
 		return false;
 	src = (uint32_t *)addr->sin6.sin6_addr.s6_addr;
-	base = (uint32_t *)rule->rule_addr;
-	mask = (uint32_t *)rule->rule_mask;
+	base = (uint32_t *)haddress->addr;
+	mask = (uint32_t *)haddress->mask;
 	return (src[0] & mask[0]) == base[0] && (src[1] & mask[1]) == base[1] &&
 	       (src[2] & mask[2]) == base[2] && (src[3] & mask[3]) == base[3];
 }
 
-int hba_eval(struct HBA *hba, PgAddr *addr, bool is_tls, const char *dbname, const char *username)
+static bool address_match(const struct HBAAddress *haddress, PgAddr *addr)
+{
+	if (haddress->flags & ADDRESS_ALL)
+		return true;
+	switch (haddress->family) {
+	case AF_INET:
+		return match_inet4(haddress, addr);
+	case AF_INET6:
+		return match_inet6(haddress, addr);
+	default:
+		return false;
+	}
+}
+
+struct HBARule * hba_eval(struct HBA *hba, PgAddr *addr, bool is_tls, ReplicationType replication, const char *dbname, const char *username)
 {
 	struct List *el;
 	struct HBARule *rule;
@@ -707,7 +948,7 @@ int hba_eval(struct HBA *hba, PgAddr *addr, bool is_tls, const char *dbname, con
 	unsigned int unamelen = strlen(username);
 
 	if (!hba)
-		return AUTH_REJECT;
+		return NULL;
 
 	list_for_each(el, &hba->rules) {
 		rule = container_of(el, struct HBARule, node);
@@ -722,24 +963,24 @@ int hba_eval(struct HBA *hba, PgAddr *addr, bool is_tls, const char *dbname, con
 			continue;
 		} else if (rule->rule_type == RULE_HOSTNOSSL && is_tls) {
 			continue;
-		} else if (rule->rule_af == AF_INET) {
-			if (!match_inet4(rule, addr))
-				continue;
-		} else if (rule->rule_af == AF_INET6) {
-			if (!match_inet6(rule, addr))
-				continue;
-		} else {
+		} else if (!address_match(&rule->address, addr)) {
 			continue;
 		}
 
 		/* match db & user */
-		if (!name_match(&rule->db_name, dbname, dbnamelen, username))
-			continue;
+		if (replication == REPLICATION_PHYSICAL) {
+			if (!(rule->db_name.flags & NAME_REPLICATION)) {
+				continue;
+			}
+		} else {
+			if (!name_match(&rule->db_name, dbname, dbnamelen, username))
+				continue;
+		}
 		if (!name_match(&rule->user_name, username, unamelen, dbname))
 			continue;
 
 		/* rule matches */
-		return rule->rule_method;
+		return rule;
 	}
-	return AUTH_REJECT;
+	return NULL;
 }

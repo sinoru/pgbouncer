@@ -64,7 +64,7 @@ def shared_setup(tmp_path_factory, worker_id):
 
     It currently sets up 2 things:
     1. A cert directory, for TLS tests
-    2. A queueing disciplince (qdisc), for tests that require latency
+    2. A queueing disciplines (qdisc), for tests that require latency
 
     It yields the certificate directory, which is why the fixture name is
     cert_dir.
@@ -116,6 +116,7 @@ def pg(tmp_path_factory, cert_dir):
             f.write(f"ssl_cert_file='{cert}'\n")
             f.write(f"ssl_key_file='{key}'\n")
 
+    pg.nossl_access("replication", "trust", user="postgres")
     pg.nossl_access("all", "trust")
     pg.nossl_access("p4", "password")
     pg.nossl_access("p5", "md5")
@@ -129,10 +130,13 @@ def pg(tmp_path_factory, cert_dir):
 
     pg.sql("create database unconfigured_auth_database")
     pg.sql("create user bouncer")
+
+    pg.sql("create user pswcheck_not_in_auth_file with superuser;")
     pg.sql("create user pswcheck with superuser createdb password 'pgbouncer-check';")
     pg.sql("create user someuser with password 'anypasswd';")
     pg.sql("create user maxedout;")
     pg.sql("create user maxedout2;")
+    pg.sql("create user poolsize1;")
     pg.sql(f"create user longpass with password '{LONG_PASSWORD}';")
     pg.sql("create user stats password 'stats';")
     pg.sql("grant all on schema public to public", dbname="p0")

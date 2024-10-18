@@ -71,6 +71,7 @@ struct event_base *pgb_event_base;
 struct DNSContext *adns;
 
 struct HBA *parsed_hba;
+struct Ident *parsed_ident;
 
 /*
  * configuration storage
@@ -80,7 +81,7 @@ int cf_daemon;
 int cf_pause_mode = P_NONE;
 int cf_shutdown = SHUTDOWN_NONE;
 int cf_reboot;
-static char *cf_username;
+static char *global_username;
 char *cf_config_file;
 
 char *cf_listen_addr;
@@ -113,6 +114,7 @@ int cf_tcp_user_timeout;
 int cf_auth_type = AUTH_MD5;
 char *cf_auth_file;
 char *cf_auth_hba_file;
+char *cf_auth_ident_file;
 char *cf_auth_user;
 char *cf_auth_query;
 char *cf_auth_dbname;
@@ -237,6 +239,7 @@ static const struct CfKey bouncer_params [] = {
 	CF_ABS("auth_dbname", CF_AUTHDB, cf_auth_dbname, 0, NULL),
 	CF_ABS("auth_file", CF_STR, cf_auth_file, 0, NULL),
 	CF_ABS("auth_hba_file", CF_STR, cf_auth_hba_file, 0, ""),
+	CF_ABS("auth_ident_file", CF_STR, cf_auth_ident_file, 0, NULL),
 	CF_ABS("auth_query", CF_STR, cf_auth_query, 0, "SELECT usename, passwd FROM pg_shadow WHERE usename=$1"),
 	CF_ABS("auth_type", CF_LOOKUP(auth_type_map), cf_auth_type, 0, "md5"),
 	CF_ABS("auth_user", CF_STR, cf_auth_user, 0, NULL),
@@ -325,7 +328,7 @@ static const struct CfKey bouncer_params [] = {
 	CF_ABS("unix_socket_mode", CF_INT, cf_unix_socket_mode, CF_NO_RELOAD, "0777"),
 #endif
 #ifndef WIN32
-	CF_ABS("user", CF_STR, cf_username, CF_NO_RELOAD, NULL),
+	CF_ABS("user", CF_STR, global_username, CF_NO_RELOAD, NULL),
 #endif
 	CF_ABS("verbose", CF_INT, cf_verbose, 0, NULL),
 
@@ -444,7 +447,18 @@ void load_config(void)
 	}
 
 	if (cf_auth_type == AUTH_HBA) {
-		struct HBA *hba = hba_load_rules(cf_auth_hba_file);
+		struct Ident *ident;
+		struct HBA *hba;
+
+		ident = ident_load_map(cf_auth_ident_file);
+
+		if (ident) {
+			ident_free(parsed_ident);
+			parsed_ident = ident;
+		}
+
+		hba = hba_load_rules(cf_auth_hba_file, parsed_ident);
+
 		if (hba) {
 			hba_free(parsed_hba);
 			parsed_hba = hba;
@@ -473,14 +487,29 @@ static struct event ev_sigint;
 
 static void handle_sigterm(evutil_socket_t sock, short flags, void *arg)
 {
-	log_info("got SIGTERM, fast exit");
-	/* pidfile cleanup happens via atexit() */
-	exit(0);
+	if (cf_shutdown) {
+		log_info("got SIGTERM while shutting down, fast exit");
+		/* pidfile cleanup happens via atexit() */
+		exit(0);
+	}
+	log_info("got SIGTERM, shutting down, waiting for all clients disconnect");
+	sd_notify(0, "STOPPING=1");
+	if (cf_reboot)
+		die("takeover was in progress, going down immediately");
+	if (cf_pause_mode == P_SUSPEND)
+		die("suspend was in progress, going down immediately");
+	cf_shutdown = SHUTDOWN_WAIT_FOR_CLIENTS;
+	cleanup_sockets();
 }
 
 static void handle_sigint(evutil_socket_t sock, short flags, void *arg)
 {
-	log_info("got SIGINT, shutting down");
+	if (cf_shutdown) {
+		log_info("got SIGINT while shutting down, fast exit");
+		/* pidfile cleanup happens via atexit() */
+		exit(0);
+	}
+	log_info("got SIGINT, shutting down, waiting for all servers connections to be released");
 	sd_notify(0, "STOPPING=1");
 	if (cf_reboot)
 		die("takeover was in progress, going down immediately");
@@ -488,13 +517,22 @@ static void handle_sigint(evutil_socket_t sock, short flags, void *arg)
 		die("suspend was in progress, going down immediately");
 	cf_pause_mode = P_PAUSE;
 	cf_shutdown = SHUTDOWN_WAIT_FOR_SERVERS;
+	cleanup_sockets();
 }
 
 #ifndef WIN32
 
+static struct event ev_sigquit;
 static struct event ev_sigusr1;
 static struct event ev_sigusr2;
 static struct event ev_sighup;
+
+static void handle_sigquit(evutil_socket_t sock, short flags, void *arg)
+{
+	log_info("got SIGQUIT, fast exit");
+	/* pidfile cleanup happens via atexit() */
+	exit(0);
+}
 
 static void handle_sigusr1(int sock, short flags, void *arg)
 {
@@ -508,6 +546,10 @@ static void handle_sigusr1(int sock, short flags, void *arg)
 
 static void handle_sigusr2(int sock, short flags, void *arg)
 {
+	if (cf_shutdown) {
+		log_info("got SIGUSR2 while shutting down, ignoring");
+		return;
+	}
 	switch (cf_pause_mode) {
 	case P_SUSPEND:
 		log_info("got SIGUSR2, continuing from SUSPEND");
@@ -520,12 +562,6 @@ static void handle_sigusr2(int sock, short flags, void *arg)
 		break;
 	case P_NONE:
 		log_info("got SIGUSR2, but not paused/suspended");
-	}
-
-	/* avoid surprise later if cf_shutdown stays set */
-	if (cf_shutdown) {
-		log_info("canceling shutdown");
-		cf_shutdown = SHUTDOWN_NONE;
 	}
 }
 
@@ -568,6 +604,11 @@ static void signal_setup(void)
 
 	evsignal_assign(&ev_sighup, pgb_event_base, SIGHUP, handle_sighup, NULL);
 	err = evsignal_add(&ev_sighup, NULL);
+	if (err < 0)
+		fatal_perror("evsignal_add");
+
+	evsignal_assign(&ev_sigquit, pgb_event_base, SIGQUIT, handle_sigquit, NULL);
+	err = evsignal_add(&ev_sigquit, NULL);
 	if (err < 0)
 		fatal_perror("evsignal_add");
 #endif
@@ -736,7 +777,7 @@ static void check_limits(void)
 	fd_count = cf_max_client_conn + 10;
 	statlist_for_each(item, &database_list) {
 		db = container_of(item, PgDatabase, head);
-		if (db->forced_user)
+		if (db->forced_user_credentials)
 			fd_count += (db->pool_size >= 0 ? db->pool_size : cf_default_pool_size);
 		else
 			fd_count += (db->pool_size >= 0 ? db->pool_size : cf_default_pool_size) * total_users;
@@ -856,6 +897,8 @@ static void cleanup(void)
 	adns = NULL;
 	hba_free(parsed_hba);
 	parsed_hba = NULL;
+	ident_free(parsed_ident);
+	parsed_ident = NULL;
 
 	admin_cleanup();
 	objects_cleanup();
@@ -869,12 +912,13 @@ static void cleanup(void)
 
 	reset_logging();
 
-	xfree(&cf_username);
+	xfree(&global_username);
 	xfree(&cf_config_file);
 	xfree(&cf_listen_addr);
 	xfree(&cf_unix_socket_dir);
 	xfree(&cf_unix_socket_group);
 	xfree(&cf_auth_file);
+	xfree(&cf_auth_ident_file);
 	xfree(&cf_auth_dbname);
 	xfree(&cf_auth_hba_file);
 	xfree(&cf_auth_query);
@@ -993,13 +1037,13 @@ int main(int argc, char *argv[])
 
 	/* prefer cmdline over config for username */
 	if (arg_username) {
-		free(cf_username);
-		cf_username = xstrdup(arg_username);
+		free(global_username);
+		global_username = xstrdup(arg_username);
 	}
 
 	/* switch user is needed */
-	if (cf_username && *cf_username)
-		change_user(cf_username);
+	if (global_username && *global_username)
+		change_user(global_username);
 
 	/* disallow running as root */
 	if (getuid() == 0)

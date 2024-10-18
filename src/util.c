@@ -50,7 +50,7 @@ int log_socket_prefix(enum LogLevel lev, void *ctx, char *dst, unsigned int dstl
 	port = pga_port(&sock->remote_addr);
 	peer_id = sock->pool ? sock->pool->db->peer_id : 0;
 	db = sock->pool ? sock->pool->db->name : "(nodb)";
-	user = sock->login_user ? sock->login_user->name : "(nouser)";
+	user = sock->login_user_credentials ? sock->login_user_credentials->name : "(nouser)";
 	if (pga_is_unix(&sock->remote_addr)) {
 		unsigned long pid = sock->remote_addr.scred.pid;
 		if (pid) {
@@ -532,3 +532,18 @@ bool check_reserved_database(const char *value)
 	}
 	return true;
 }
+
+/*
+ * Same as strcmp, but handles NULLs. If both sides are NULL, returns "true".
+ */
+bool strings_equal(const char *str_left, const char *str_right)
+{
+	if (str_left == NULL && str_right == NULL)
+		return true;
+
+	if (str_left == NULL || str_right == NULL)
+		return false;
+
+	return strcmp(str_left, str_right) == 0;
+}
+

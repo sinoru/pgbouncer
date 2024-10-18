@@ -23,9 +23,18 @@ async def test_max_client_conn(bouncer):
 
 @pytest.mark.asyncio
 async def test_pool_size(pg, bouncer):
-    await bouncer.asleep(0.5, times=10)
+    # per user pool_size
+    await bouncer.asleep(0.5, dbname="p0a", user="poolsize1", times=3)
+    assert pg.connection_count(dbname="p0", users=("poolsize1",)) == 1
+    # even though we connect using user poolsize1 its setting do not apply is forced user is configured for db
+    await bouncer.asleep(0.5, dbname="p0", user="poolsize1", times=5)
+    assert pg.connection_count(dbname="p0", users=("bouncer",)) == 2
+
+    # per db pool_size
+    await bouncer.asleep(0.5, times=5)
     assert pg.connection_count("p0") == 2
 
+    # global pool_size
     bouncer.default_db = "p1"
     await bouncer.asleep(0.5, times=10)
     assert pg.connection_count("p1") == 5
@@ -89,7 +98,7 @@ def test_min_pool_size_with_lower_max_user_connections(bouncer):
 
     # Running a query for sufficient time for us to reach the final
     # connection count in the pool and detect any evictions.
-    with bouncer.log_contains("new connection to server", times=2):
+    with bouncer.log_contains(r"new connection to server \(from", times=2):
         with bouncer.log_contains("closing because: evicted", times=0):
             bouncer.sleep(2, dbname="p0x", user="maxedout2")
 
@@ -102,7 +111,7 @@ def test_min_pool_size_with_lower_max_db_connections(bouncer):
 
     # Running a query for sufficient time for us to reach the final
     # connection count in the pool and detect any evictions.
-    with bouncer.log_contains("new connection to server", times=2):
+    with bouncer.log_contains(r"new connection to server \(from", times=2):
         with bouncer.log_contains("closing because: evicted", times=0):
             bouncer.sleep(2, dbname="p0y", user="puser1")
 

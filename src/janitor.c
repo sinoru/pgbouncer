@@ -187,7 +187,14 @@ static void per_loop_activate(PgPool *pool)
 	sv_used = statlist_count(&pool->used_server_list);
 	statlist_for_each_safe(item, &pool->waiting_client_list, tmp) {
 		client = container_of(item, PgSocket, head);
-		if (!statlist_empty(&pool->idle_server_list)) {
+		if (client->replication) {
+			/*
+			 * For replication connections we always launch
+			 * a new connection, but we continue with the loop,
+			 * because there might be normal clients waiting too.
+			 */
+			launch_new_connection(pool, /* evict_if_needed= */ true);
+		} else if (!statlist_empty(&pool->idle_server_list)) {
 			/* db not fully initialized after reboot */
 			if (client->wait_for_welcome && !pool->welcome_msg_ready) {
 				launch_new_connection(pool, /* evict_if_needed= */ true);
@@ -397,7 +404,9 @@ static void pool_client_maint(PgPool *pool)
 				age = now - client->query_start;
 			}
 
-			if (cf_query_timeout > 0 && age > cf_query_timeout) {
+			if (cf_shutdown == SHUTDOWN_WAIT_FOR_SERVERS) {
+				disconnect_client(client, true, "server shutting down");
+			} else if (cf_query_timeout > 0 && age > cf_query_timeout) {
 				disconnect_client(client, true, "query_timeout");
 			} else if (cf_query_wait_timeout > 0 && age > cf_query_wait_timeout) {
 				disconnect_client(client, true, "query_wait_timeout");
@@ -453,6 +462,8 @@ static void peer_pool_client_maint(PgPool *pool)
 static void check_unused_servers(PgPool *pool, struct StatList *slist, bool idle_test)
 {
 	usec_t now = get_cached_time();
+	usec_t server_lifetime = pool_server_lifetime(pool);
+
 	struct List *item, *tmp;
 	usec_t idle, age;
 	PgSocket *server;
@@ -473,7 +484,7 @@ static void check_unused_servers(PgPool *pool, struct StatList *slist, bool idle
 		} else if (cf_server_idle_timeout > 0 && idle > cf_server_idle_timeout
 			   && (pool_min_pool_size(pool) == 0 || pool_connected_server_count(pool) > pool_min_pool_size(pool))) {
 			disconnect_server(server, true, "server idle timeout");
-		} else if (age >= cf_server_lifetime) {
+		} else if (age >= server_lifetime) {
 			if (life_over(server)) {
 				disconnect_server(server, true, "server lifetime over");
 				pool->last_lifetime_disconnect = now;
@@ -515,7 +526,7 @@ static void check_pool_size(PgPool *pool)
 	    cur < pool_pool_size(pool) &&
 	    cf_pause_mode == P_NONE &&
 	    cf_reboot == 0 &&
-	    (pool_client_count(pool) > 0 || pool->db->forced_user != NULL)) {
+	    (pool_client_count(pool) > 0 || pool->db->forced_user_credentials != NULL)) {
 		log_debug("launching new connection to satisfy min_pool_size");
 		launch_new_connection(pool, /* evict_if_needed= */ false);
 	}
@@ -533,14 +544,24 @@ static void pool_server_maint(PgPool *pool)
 	check_unused_servers(pool, &pool->tested_server_list, 0);
 	check_unused_servers(pool, &pool->idle_server_list, 1);
 
-	/* disconnect close_needed active servers if server_fast_close is set */
-	if (cf_server_fast_close) {
-		statlist_for_each_safe(item, &pool->active_server_list, tmp) {
-			server = container_of(item, PgSocket, head);
-			Assert(server->state == SV_ACTIVE);
-			if (server->ready && server->close_needed)
-				disconnect_server(server, true, "database configuration changed");
-		}
+	statlist_for_each_safe(item, &pool->active_server_list, tmp) {
+		server = container_of(item, PgSocket, head);
+		Assert(server->state == SV_ACTIVE);
+		/*
+		 * Disconnect active servers without outstanding requests if
+		 * server_fast_close is set. This only applies to session
+		 * pooling.
+		 */
+		if (cf_server_fast_close && server->ready && server->close_needed)
+			disconnect_server(server, true, "database configuration changed");
+		/*
+		 * Always disconnect close_needed replication servers. These
+		 * connections are expected to be very long lived (possibly
+		 * indefinitely), so waiting until the session/transaction is
+		 * over is not an option.
+		 */
+		if (server->replication && server->close_needed)
+			disconnect_server(server, true, "database configuration changed");
 	}
 
 	/* handle query_timeout and idle_transaction_timeout */
@@ -694,8 +715,8 @@ static void do_full_maint(evutil_socket_t sock, short flags, void *arg)
 	   _	 */
 	statlist_for_each_safe(item, &database_list, tmp) {
 		db = container_of(item, PgDatabase, head);
-		if (database_min_pool_size(db) > 0 && db->forced_user != NULL) {
-			get_pool(db, db->forced_user);
+		if (database_min_pool_size(db) > 0 && db->forced_user_credentials != NULL) {
+			get_pool(db, db->forced_user_credentials);
 		}
 	}
 
@@ -737,6 +758,13 @@ static void do_full_maint(evutil_socket_t sock, short flags, void *arg)
 
 	if (cf_shutdown == SHUTDOWN_WAIT_FOR_SERVERS && get_active_server_count() == 0) {
 		log_info("server connections dropped, exiting");
+		cf_shutdown = SHUTDOWN_IMMEDIATE;
+		event_base_loopbreak(pgb_event_base);
+		return;
+	}
+
+	if (cf_shutdown == SHUTDOWN_WAIT_FOR_CLIENTS && get_active_client_count() == 0) {
+		log_info("client connections dropped, exiting");
 		cf_shutdown = SHUTDOWN_IMMEDIATE;
 		event_base_loopbreak(pgb_event_base);
 		return;
@@ -815,8 +843,8 @@ void kill_database(PgDatabase *db)
 	pktbuf_free(db->startup_params);
 	free(db->host);
 
-	if (db->forced_user)
-		slab_free(user_cache, db->forced_user);
+	if (db->forced_user_credentials)
+		slab_free(credentials_cache, db->forced_user_credentials);
 	free(db->connect_query);
 	if (db->inactive_time) {
 		statlist_remove(&autodatabase_idle_list, &db->head);

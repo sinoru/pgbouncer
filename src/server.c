@@ -21,6 +21,7 @@
  */
 
 #include "bouncer.h"
+#include "usual/time.h"
 
 #include <usual/slab.h>
 
@@ -148,7 +149,25 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
 		break;
 
 	case 'E':		/* ErrorResponse */
-		kill_pool_logins_server_error(server->pool, pkt);
+		/*
+		 * If we cannot log into the server, then we drop all clients
+		 * that are currently trying to log in because they will almost
+		 * certainly hit the same error.
+		 *
+		 * However, we don't do this if it's a replication connection,
+		 * because those can fail due to a variety of missing
+		 * permissions specific to replication connections, such as
+		 * missing REPLICATION role or missing pg_hba.conf line for the
+		 * replication database. In such cases normal connections would
+		 * still be able connect and query the database just fine, so
+		 * we don't want to kill all of those just yet. If there really
+		 * is a problem impacting all connections, we can wait for a
+		 * normal connection to report this problem.
+		 */
+		if (!server->replication)
+			kill_pool_logins_server_error(server->pool, pkt);
+		else
+			log_server_error("S: login failed", pkt);
 
 		disconnect_server(server, true, "login failed");
 		break;
@@ -215,9 +234,31 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
 	return res;
 }
 
-int pool_pool_mode(PgPool *pool)
+/*
+ * connection_pool_mode returns the pool_mode for the server. It specifically
+ * forces session pooling if the server is a replication connection, because
+ * replication connections require session pooling to work correctly.
+ */
+int connection_pool_mode(PgSocket *connection)
 {
-	int pool_mode = pool->user->pool_mode;
+	if (connection->replication)
+		return POOL_SESSION;
+	return probably_wrong_pool_pool_mode(connection->pool);
+}
+
+/*
+ * probably_wrong_pool_pool_mode returns the pool_mode for the pool.
+ *
+ * IMPORTANT: You should almost certainly not use this function directly,
+ * because the pool_mode of a pool is not necessarily the same as the pool mode
+ * of each of the clients and servers in the pool. Most importantly replication
+ * connections in a transaction/statement pool will still use session pooling.
+ *
+ * Normally you should use connection_pool_mode()
+ */
+int probably_wrong_pool_pool_mode(PgPool *pool)
+{
+	int pool_mode = pool->user_credentials->global_user->pool_mode;
 	if (pool_mode == POOL_INHERIT)
 		pool_mode = pool->db->pool_mode;
 	if (pool_mode == POOL_INHERIT)
@@ -227,16 +268,28 @@ int pool_pool_mode(PgPool *pool)
 
 int pool_pool_size(PgPool *pool)
 {
-	if (pool->db->pool_size < 0)
-		return cf_default_pool_size;
-	else
+	int user_pool_size = pool->user_credentials ? pool->user_credentials->global_user->pool_size : -1;
+	if (user_pool_size >= 0)
+		return user_pool_size;
+	else if (pool->db->pool_size >= 0)
 		return pool->db->pool_size;
+	else
+		return cf_default_pool_size;
 }
 
 /* min_pool_size of the pool's db */
 int pool_min_pool_size(PgPool *pool)
 {
 	return database_min_pool_size(pool->db);
+}
+
+/* server_lifetime of the pool's db */
+usec_t pool_server_lifetime(PgPool *pool)
+{
+	if (pool->db->server_lifetime == 0)
+		return cf_server_lifetime;
+	else
+		return pool->db->server_lifetime;
 }
 
 /* min_pool_size of the db */
@@ -264,7 +317,7 @@ int database_max_connections(PgDatabase *db)
 		return db->max_db_connections;
 }
 
-int user_max_connections(PgUser *user)
+int user_max_connections(PgGlobalUser *user)
 {
 	if (user->max_user_connections <= 0)
 		return cf_max_user_connections;
@@ -309,7 +362,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 		/* set ready only if no tx */
 		if (state == 'I') {
 			ready = true;
-		} else if (pool_pool_mode(server->pool) == POOL_STMT) {
+		} else if (connection_pool_mode(server) == POOL_STMT) {
 			disconnect_server(server, true, "transaction blocks not allowed in statement pooling mode");
 			return false;
 		} else if (state == 'T' || state == 'E') {
@@ -402,7 +455,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 		 * expect certain queries to be prepared at the server that are
 		 * not.
 		 */
-		if (is_prepared_statements_enabled(server->pool)
+		if (is_prepared_statements_enabled(server)
 		    && (pkt->len == 1 + 4 + 15 || pkt->len == 1 + 4 + 12)) {	/* size of complete DEALLOCATE/DISCARD ALL */
 			const char *tag;
 			if (mbuf_get_string(&pkt->data, &tag)) {
@@ -432,6 +485,7 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 
 	/* copy mode */
 	case 'G':		/* CopyInResponse */
+	case 'W':		/* CopyBothResponse */
 		slog_debug(server, "COPY started");
 		server->copy_mode = true;
 		break;
@@ -749,7 +803,7 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
 			/*
 			 * It's possible that the client vars and server vars have
 			 * different string representations, but still Postgres did not
-			 * send a ParamaterStatus packet. This happens when the server
+			 * send a ParameterStatus packet. This happens when the server
 			 * variable is the canonical version of the client variable, i.e.
 			 * they mean the same just written slightly different. To make sure
 			 * that the canonical version is also stored in the client, we now
@@ -764,7 +818,7 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
 			break;
 		}
 
-		if (pool_pool_mode(pool) != POOL_SESSION || server->state == SV_TESTED || server->resetting) {
+		if (connection_pool_mode(server) != POOL_SESSION || server->state == SV_TESTED || server->resetting) {
 			server->resetting = false;
 			switch (server->state) {
 			case SV_ACTIVE:

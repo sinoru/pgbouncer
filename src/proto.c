@@ -102,8 +102,10 @@ bool get_header(struct MBuf *data, PktHdr *pkt)
 			type = PKT_SSLREQ;
 		} else if (code == PKT_GSSENCREQ) {
 			type = PKT_GSSENCREQ;
-		} else if ((code >> 16) == 3 && (code & 0xFFFF) < 2) {
-			type = PKT_STARTUP;
+		} else if (code >= PKT_STARTUP_V3 && code < PKT_STARTUP_V3_UNSUPPORTED) {
+			type = PKT_STARTUP_V3;
+		} else if (code >= PKT_STARTUP_V3_UNSUPPORTED && code < PKT_STARTUP_V4) {
+			type = PKT_STARTUP_V3_UNSUPPORTED;
 		} else if (code == PKT_STARTUP_V2) {
 			type = PKT_STARTUP_V2;
 		} else {
@@ -321,18 +323,18 @@ bool welcome_client(PgSocket *client)
  * Password authentication for server
  */
 
-static PgUser *get_srv_psw(PgSocket *server)
+static PgCredentials *get_srv_psw(PgSocket *server)
 {
 	PgDatabase *db = server->pool->db;
-	PgUser *user = server->pool->user;
+	PgCredentials *credentials = server->pool->user_credentials;
 
 	/* if forced user without password, use userlist psw */
-	if (!user->passwd[0] && db->forced_user) {
-		PgUser *u2 = find_user(user->name);
-		if (u2)
-			return u2;
+	if (!credentials->passwd[0] && db->forced_user_credentials) {
+		PgCredentials *c2 = find_global_credentials(credentials->name);
+		if (c2)
+			return c2;
 	}
-	return user;
+	return credentials;
 }
 
 /* actual packet send */
@@ -345,26 +347,26 @@ static bool send_password(PgSocket *server, const char *enc_psw)
 
 static bool login_clear_psw(PgSocket *server)
 {
-	PgUser *user = get_srv_psw(server);
+	PgCredentials *credentials = get_srv_psw(server);
 	slog_debug(server, "P: send clear password");
-	return send_password(server, user->passwd);
+	return send_password(server, credentials->passwd);
 }
 
 static bool login_md5_psw(PgSocket *server, const uint8_t *salt)
 {
 	char txt[MD5_PASSWD_LEN + 1], *src;
-	PgUser *user = get_srv_psw(server);
+	PgCredentials *credentials = get_srv_psw(server);
 
 	slog_debug(server, "P: send md5 password");
 
-	switch (get_password_type(user->passwd)) {
+	switch (get_password_type(credentials->passwd)) {
 	case PASSWORD_TYPE_PLAINTEXT:
-		if (!pg_md5_encrypt(user->passwd, user->name, strlen(user->name), txt))
+		if (!pg_md5_encrypt(credentials->passwd, credentials->name, strlen(credentials->name), txt))
 			return false;
 		src = txt + 3;
 		break;
 	case PASSWORD_TYPE_MD5:
-		src = user->passwd + 3;
+		src = credentials->passwd + 3;
 		break;
 	default:
 		slog_error(server, "cannot do MD5 authentication: wrong password type");
@@ -380,16 +382,16 @@ static bool login_md5_psw(PgSocket *server, const uint8_t *salt)
 
 static bool login_scram_sha_256(PgSocket *server)
 {
-	PgUser *user = get_srv_psw(server);
+	PgCredentials *credentials = get_srv_psw(server);
 	bool res;
 	char *client_first_message = NULL;
 
-	switch (get_password_type(user->passwd)) {
+	switch (get_password_type(credentials->passwd)) {
 	case PASSWORD_TYPE_PLAINTEXT:
 		/* ok */
 		break;
 	case PASSWORD_TYPE_SCRAM_SHA_256:
-		if (!user->has_scram_keys) {
+		if (!credentials->has_scram_keys) {
 			slog_error(server, "cannot do SCRAM authentication: password is SCRAM secret but client authentication did not provide SCRAM keys");
 			kill_pool_logins(server->pool, NULL, "server login failed: wrong password type");
 			return false;
@@ -420,7 +422,7 @@ static bool login_scram_sha_256(PgSocket *server)
 
 static bool login_scram_sha_256_cont(PgSocket *server, unsigned datalen, const uint8_t *data)
 {
-	PgUser *user = get_srv_psw(server);
+	PgCredentials *credentials = get_srv_psw(server);
 	char *ibuf = NULL;
 	char *input;
 	char *server_nonce;
@@ -453,7 +455,7 @@ static bool login_scram_sha_256_cont(PgSocket *server, unsigned datalen, const u
 		goto failed;
 
 	client_final_message = build_client_final_message(&server->scram_state,
-							  user, server_nonce,
+							  credentials, server_nonce,
 							  salt, saltlen, iterations);
 
 	free(salt);
@@ -474,7 +476,7 @@ failed:
 
 static bool login_scram_sha_256_final(PgSocket *server, unsigned datalen, const uint8_t *data)
 {
-	PgUser *user = get_srv_psw(server);
+	PgCredentials *credentials = get_srv_psw(server);
 	char *ibuf = NULL;
 	char *input;
 	char ServerSignature[SHA256_DIGEST_LENGTH];
@@ -495,7 +497,7 @@ static bool login_scram_sha_256_final(PgSocket *server, unsigned datalen, const 
 	if (!read_server_final_message(server, input, ServerSignature))
 		goto failed;
 
-	if (!verify_server_signature(&server->scram_state, user, ServerSignature)) {
+	if (!verify_server_signature(&server->scram_state, credentials, ServerSignature)) {
 		slog_error(server, "invalid server signature");
 		kill_pool_logins(server->pool, NULL, "server login failed: invalid server signature");
 		goto failed;
@@ -597,15 +599,69 @@ bool answer_authreq(PgSocket *server, PktHdr *pkt)
 
 bool send_startup_packet(PgSocket *server)
 {
-	PgDatabase *db = server->pool->db;
-	const char *username = server->pool->user->name;
-	PktBuf *pkt;
+	PgPool *pool = server->pool;
+	PgDatabase *db = pool->db;
+	const char *username = server->pool->user_credentials->name;
+	PktBuf *pkt = pktbuf_temp();
+	PgSocket *client = NULL;
 
-	pkt = pktbuf_temp();
-	pktbuf_write_StartupMessage(pkt, username,
-				    db->startup_params->buf,
-				    db->startup_params->write_pos);
-	return pktbuf_send_immediate(pkt, server);
+	pktbuf_start_packet(pkt, PKT_STARTUP_V3);
+	pktbuf_put_bytes(pkt, db->startup_params->buf, db->startup_params->write_pos);
+
+	/*
+	 * If the next client in the list is a replication connection, we need
+	 * to do some special stuff for it.
+	 */
+	client = first_socket(&pool->waiting_client_list);
+	if (client && client->replication) {
+		server->replication = client->replication;
+		pktbuf_put_string(pkt, "replication");
+		slog_debug(server, "send_startup_packet: creating replication connection");
+		pktbuf_put_string(pkt, replication_type_parameters[server->replication]);
+
+		/*
+		 * For a replication connection we apply the varcache in the
+		 * startup instead of through SET commands after connecting.
+		 * The main reason to do so is because physical replication
+		 * connections don't allow SET commands. A second reason is
+		 * because it allows us to skip running the SET logic
+		 * completely, which normally requires waiting on multiple
+		 * server responses. This SET logic is normally executed in the
+		 * codepath where we link the client to the server
+		 * (find_server), but because we link the client here already
+		 * we don't run that code for replication connections. Adding
+		 * the varcache parameters to the startup message allows us to
+		 * skip the dance that involves sending Query packets and
+		 * waiting for responses.
+		 */
+		varcache_apply_startup(pkt, client);
+		if (client->startup_options) {
+			pktbuf_put_string(pkt, "options");
+			pktbuf_put_string(pkt, client->startup_options);
+		}
+	}
+
+	pktbuf_put_string(pkt, "user");
+	pktbuf_put_string(pkt, username);
+	pktbuf_put_string(pkt, "");	/* terminator required in StartupMessage */
+	pktbuf_finish_packet(pkt);
+
+	if (!pktbuf_send_immediate(pkt, server)) {
+		return false;
+	}
+
+	if (server->replication) {
+		/*
+		 * We link replication connections to a client directly when they are
+		 * created. One reason for is because the startup parameters need to be
+		 * forwarded, because physical replication connections don't allow SET
+		 * commands. Another reason is so that we don't need a separate state.
+		 */
+		client->link = server;
+		server->link = client;
+	}
+
+	return true;
 }
 
 bool send_sslreq_packet(PgSocket *server)
