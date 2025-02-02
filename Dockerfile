@@ -1,4 +1,4 @@
-FROM alpine AS base
+FROM alpine:3.21 AS base
 ARG TARGETPLATFORM
 
 RUN \
@@ -7,7 +7,6 @@ RUN \
     --mount=type=tmpfs,target=/var/log \
     set -eux; \
     apk add \
-        ca-certificates \
         c-ares \
         libevent \
         libssl3 \
@@ -29,6 +28,7 @@ RUN \
         automake \
         build-base \
         c-ares-dev \
+        ca-certificates \
         libevent-dev \
         libtool \
         linux-headers \
