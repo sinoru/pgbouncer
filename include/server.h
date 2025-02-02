@@ -18,6 +18,7 @@
 
 bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *pkt)  _MUSTCHECK;
 void kill_pool_logins(PgPool *pool, const char *sqlstate, const char *msg);
+const char * kill_pool_logins_server_error(PgPool *pool, PktHdr *errpkt);
 int connection_pool_mode(PgSocket *server) _MUSTCHECK;
 int probably_wrong_pool_pool_mode(PgPool *pool) _MUSTCHECK;
 int pool_pool_size(PgPool *pool) _MUSTCHECK;
@@ -26,4 +27,6 @@ usec_t pool_server_lifetime(PgPool *pool) _MUSTCHECK;
 int database_min_pool_size(PgDatabase *db) _MUSTCHECK;
 int pool_res_pool_size(PgPool *pool) _MUSTCHECK;
 int database_max_connections(PgDatabase *db) _MUSTCHECK;
+int database_max_client_connections(PgDatabase *db) _MUSTCHECK;
 int user_max_connections(PgGlobalUser *user) _MUSTCHECK;
+int user_client_max_connections(PgGlobalUser *user) _MUSTCHECK;

@@ -94,7 +94,7 @@ static bool check_client_passwd(PgSocket *client, const char *passwd)
 		return false;
 
 	switch (auth_type) {
-	case AUTH_PLAIN:
+	case AUTH_TYPE_PLAIN:
 		switch (get_password_type(user->passwd)) {
 		case PASSWORD_TYPE_PLAINTEXT:
 			return strcmp(user->passwd, passwd) == 0;
@@ -109,7 +109,7 @@ static bool check_client_passwd(PgSocket *client, const char *passwd)
 		default:
 			return false;
 		}
-	case AUTH_MD5: {
+	case AUTH_TYPE_MD5: {
 		char *stored_passwd;
 		char md5[MD5_PASSWD_LEN + 1];
 
@@ -143,14 +143,14 @@ static bool send_client_authreq(PgSocket *client)
 	int res;
 	int auth_type = client->client_auth_type;
 
-	if (auth_type == AUTH_MD5) {
+	if (auth_type == AUTH_TYPE_MD5) {
 		uint8_t saltlen = 4;
 		get_random_bytes((void *)client->tmp_login_salt, saltlen);
-		SEND_generic(res, client, 'R', "ib", AUTH_MD5, client->tmp_login_salt, saltlen);
-	} else if (auth_type == AUTH_PLAIN || auth_type == AUTH_PAM) {
-		SEND_generic(res, client, 'R', "i", AUTH_PLAIN);
-	} else if (auth_type == AUTH_SCRAM_SHA_256) {
-		SEND_generic(res, client, 'R', "iss", AUTH_SASL, "SCRAM-SHA-256", "");
+		SEND_generic(res, client, PqMsg_AuthenticationRequest, "ib", AUTH_REQ_MD5, client->tmp_login_salt, saltlen);
+	} else if (auth_type == AUTH_TYPE_PLAIN || auth_type == AUTH_TYPE_PAM) {
+		SEND_generic(res, client, PqMsg_AuthenticationRequest, "i", AUTH_REQ_PASSWORD);
+	} else if (auth_type == AUTH_TYPE_SCRAM_SHA_256) {
+		SEND_generic(res, client, PqMsg_AuthenticationRequest, "iss", AUTH_REQ_SASL, "SCRAM-SHA-256", "");
 	} else {
 		return false;
 	}
@@ -164,6 +164,15 @@ static bool send_client_authreq(PgSocket *client)
 	return res;
 }
 
+/*
+ * Returns true if the client is currently trying to send an auth query to the
+ * server.
+ */
+bool sending_auth_query(PgSocket *client)
+{
+	return client->wait_for_user_conn || client->wait_for_user;
+}
+
 static void start_auth_query(PgSocket *client, const char *username)
 {
 	int res;
@@ -175,8 +184,12 @@ static void start_auth_query(PgSocket *client, const char *username)
 	if (!auth_db)
 		return;
 	client->pool = get_pool(auth_db, client->db->auth_user_credentials);
+	if (!client->pool) {
+		disconnect_client(client, true, "no memory for authentication pool");
+		return;
+	}
+	client->wait_for_user_conn = true;
 	if (!find_server(client)) {
-		client->wait_for_user_conn = true;
 		return;
 	}
 	slog_noise(client, "doing auth_conn query: %s", auth_query);
@@ -193,7 +206,7 @@ static void start_auth_query(PgSocket *client, const char *username)
 	 * Add outstanding request, so that the server is closed if the client
 	 * disconnects before the auth_query completes.
 	 */
-	if (!add_outstanding_request(client, 'S', RA_SKIP)) {
+	if (!add_outstanding_request(client, PqMsg_Sync, RA_SKIP)) {
 		disconnect_server(client->link, true, "out of memory");
 		return;
 	}
@@ -360,7 +373,7 @@ static bool finish_set_pool(PgSocket *client, bool takeover)
 		return finish_client_login(client);
 
 	auth = cf_auth_type;
-	if (auth == AUTH_HBA) {
+	if (auth == AUTH_TYPE_HBA) {
 		rule = hba_eval(
 			parsed_hba,
 			&client->remote_addr,
@@ -379,34 +392,34 @@ static bool finish_set_pool(PgSocket *client, bool takeover)
 		auth = rule->rule_method;
 	}
 
-	if (auth == AUTH_MD5) {
+	if (auth == AUTH_TYPE_MD5) {
 		if (get_password_type(client->login_user_credentials->passwd) == PASSWORD_TYPE_SCRAM_SHA_256)
-			auth = AUTH_SCRAM_SHA_256;
+			auth = AUTH_TYPE_SCRAM_SHA_256;
 	}
 
 	/* remember method */
 	client->client_auth_type = auth;
 
 	switch (auth) {
-	case AUTH_ANY:
+	case AUTH_TYPE_ANY:
 		ok = finish_client_login(client);
 		break;
-	case AUTH_TRUST:
+	case AUTH_TYPE_TRUST:
 		if (client->login_user_credentials->mock_auth)
 			disconnect_client(client, true, "\"trust\" authentication failed");
 		else
 			ok = finish_client_login(client);
 		break;
-	case AUTH_PLAIN:
-	case AUTH_MD5:
-	case AUTH_PAM:
-	case AUTH_SCRAM_SHA_256:
+	case AUTH_TYPE_PLAIN:
+	case AUTH_TYPE_MD5:
+	case AUTH_TYPE_PAM:
+	case AUTH_TYPE_SCRAM_SHA_256:
 		ok = send_client_authreq(client);
 		break;
-	case AUTH_CERT:
+	case AUTH_TYPE_CERT:
 		ok = login_via_cert(client, rule);
 		break;
-	case AUTH_PEER:
+	case AUTH_TYPE_PEER:
 		ok = login_as_unix_peer(client, rule);
 		break;
 	default:
@@ -414,6 +427,65 @@ static bool finish_set_pool(PgSocket *client, bool takeover)
 		ok = false;
 	}
 	return ok;
+}
+
+bool check_db_connection_count(PgSocket *client)
+{
+	if (!client->contributes_db_client_count) {
+		client->contributes_db_client_count = true;
+		client->db->client_connection_count++;
+	}
+
+	if (database_max_client_connections(client->db) <= 0)
+		return true;
+
+	if (client->db->client_connection_count <= database_max_client_connections(client->db))
+		return true;
+
+	if (client->db->admin && strlist_contains(cf_admin_users, client->login_user_credentials->name))
+		return true;
+
+	log_debug("set_pool: db '%s' full (%d >= %d)",
+		  client->db->name, client->db->client_connection_count, client->db->max_db_client_connections);
+	disconnect_client(client, true, "client connections exceeded (max_db_client_connections)");
+
+	return false;
+}
+
+bool check_user_connection_count(PgSocket *client)
+{
+	int client_connection_count;
+	int max_user_client_connections;
+
+	/* Check client_connection count limit */
+	if (!client->login_user_credentials)
+		return true;
+
+	if (!client->login_user_credentials->global_user)
+		return true;
+
+	if (!client->user_connection_counted) {
+		client->login_user_credentials->global_user->client_connection_count++;
+		client->user_connection_counted = 1;
+	}
+
+	if (client->db->admin && strlist_contains(cf_admin_users, client->login_user_credentials->name)) {
+		return true;
+	}
+
+	max_user_client_connections = user_client_max_connections(client->login_user_credentials->global_user);
+	if (max_user_client_connections == 0)
+		return true;
+
+	client_connection_count = client->login_user_credentials->global_user->client_connection_count;
+	if (client_connection_count <= max_user_client_connections)
+		return true;
+
+	log_debug("set_pool: user '%s' full (%d >= %d)",
+		  client->login_user_credentials->name, client_connection_count, max_user_client_connections);
+	disconnect_client(client, true, "client connections exceeded (max_user_client_connections)");
+
+	return false;
 }
 
 bool set_pool(PgSocket *client, const char *dbname, const char *username, const char *password, bool takeover)
@@ -449,7 +521,7 @@ bool set_pool(PgSocket *client, const char *dbname, const char *username, const 
 	}
 
 	/* find user */
-	if (cf_auth_type == AUTH_ANY) {
+	if (cf_auth_type == AUTH_TYPE_ANY) {
 		/* ignore requested user */
 		if (client->db->forced_user_credentials == NULL) {
 			slog_error(client, "auth_type=any requires forced user");
@@ -457,7 +529,13 @@ bool set_pool(PgSocket *client, const char *dbname, const char *username, const 
 			return false;
 		}
 		client->login_user_credentials = client->db->forced_user_credentials;
-	} else if (cf_auth_type == AUTH_PAM) {
+
+		if (!check_db_connection_count(client))
+			return false;
+
+		if (!check_user_connection_count(client))
+			return false;
+	} else if (client->client_auth_type == AUTH_TYPE_PAM) {
 		if (client->db->auth_user_credentials) {
 			slog_error(client, "PAM can't be used together with database authentication");
 			disconnect_client(client, true, "bouncer config error");
@@ -465,14 +543,27 @@ bool set_pool(PgSocket *client, const char *dbname, const char *username, const 
 		}
 		/* Password will be set after successful authentication when not in takeover mode */
 		client->login_user_credentials = add_pam_credentials(username, password);
+		if (!check_db_connection_count(client))
+			return false;
 		if (!client->login_user_credentials) {
 			slog_error(client, "set_pool(): failed to allocate new PAM user");
 			disconnect_client(client, true, "bouncer resources exhaustion");
 			return false;
 		}
+		if (!check_user_connection_count(client)) {
+			return false;
+		}
 	} else {
 		client->login_user_credentials = find_global_credentials(username);
+
+		if (!check_db_connection_count(client))
+			return false;
+
+		if (!check_user_connection_count(client))
+			return false;
+
 		if (!client->login_user_credentials || client->login_user_credentials->dynamic_passwd) {
+			PgGlobalUser *global_user;
 			/*
 			 * If the login user specified by the client
 			 * does not exist or if it has no entry in auth_file,
@@ -481,9 +572,12 @@ bool set_pool(PgSocket *client, const char *dbname, const char *username, const 
 			 * see if the global auth_user is set and use that.
 			 */
 			if (!client->db->auth_user_credentials && cf_auth_user) {
-				client->db->auth_user_credentials = find_global_credentials(cf_auth_user);
-				if (!client->db->auth_user_credentials)
-					client->db->auth_user_credentials = add_global_credentials(cf_auth_user, "");
+				client->db->auth_user_credentials = find_or_add_new_global_credentials(cf_auth_user, "");
+				if (client->db->auth_user_credentials == NULL) {
+					slog_error(client, "set_pool(): failed to allocate a new global credentials");
+					disconnect_client(client, true, "bouncer resources exhaustion");
+					return false;
+				}
 			}
 			if (client->db->auth_user_credentials) {
 				if (client->db->fake) {
@@ -491,6 +585,13 @@ bool set_pool(PgSocket *client, const char *dbname, const char *username, const 
 				} else {
 					if (takeover) {
 						client->login_user_credentials = add_dynamic_credentials(client->db, username, password);
+
+						if (!check_db_connection_count(client))
+							return false;
+
+						if (!check_user_connection_count(client))
+							return false;
+
 						return finish_set_pool(client, takeover);
 					}
 					start_auth_query(client, username);
@@ -500,8 +601,27 @@ bool set_pool(PgSocket *client, const char *dbname, const char *username, const 
 
 			slog_info(client, "no such user: %s", username);
 			client->login_user_credentials = calloc(1, sizeof(*client->login_user_credentials));
+
+			/*
+			 * For users that we are already tracking, we want to
+			 * track this correctly as a connection count. But for
+			 * users that we don't know about at all, we don't want
+			 * to create a new global user. That's why we use
+			 * find_global_user instead of
+			 * find_or_add_new_global_user.
+			 */
+			global_user = find_global_user(username);
+			if (global_user)
+				client->login_user_credentials->global_user = global_user;
+
+			if (!check_db_connection_count(client))
+				return false;
+
 			client->login_user_credentials->mock_auth = true;
 			safe_strcpy(client->login_user_credentials->name, username, sizeof(client->login_user_credentials->name));
+			if (!check_user_connection_count(client)) {
+				return false;
+			}
 		}
 	}
 
@@ -517,7 +637,7 @@ bool handle_auth_query_response(PgSocket *client, PktHdr *pkt)
 	PgSocket *server = client->link;
 
 	switch (pkt->type) {
-	case 'T':	/* RowDescription */
+	case PqMsg_RowDescription:
 		if (!mbuf_get_uint16be(&pkt->data, &columns)) {
 			disconnect_server(server, false, "bad packet");
 			return false;
@@ -527,7 +647,7 @@ bool handle_auth_query_response(PgSocket *client, PktHdr *pkt)
 			return false;
 		}
 		break;
-	case 'D':	/* DataRow */
+	case PqMsg_DataRow:
 		memset(&credentials, 0, sizeof(credentials));
 		if (!mbuf_get_uint16be(&pkt->data, &columns)) {
 			disconnect_server(server, false, "bad packet");
@@ -575,22 +695,25 @@ bool handle_auth_query_response(PgSocket *client, PktHdr *pkt)
 
 		slog_debug(client, "successfully parsed auth_query response for user %s", credentials.name);
 		client->login_user_credentials = add_dynamic_credentials(client->db, credentials.name, credentials.passwd);
+		if (!check_user_connection_count(client)) {
+			return false;
+		}
 		if (!client->login_user_credentials) {
 			disconnect_server(server, false, "unable to allocate new user for auth");
 			return false;
 		}
 		break;
-	case 'N':	/* NoticeResponse */
+	case PqMsg_NoticeResponse:
 		break;
-	case 'C':	/* CommandComplete */
+	case PqMsg_CommandComplete:
 		break;
-	case '1':	/* ParseComplete */
+	case PqMsg_ParseComplete:
 		break;
-	case '2':	/* BindComplete */
+	case PqMsg_BindComplete:
 		break;
-	case 'S':	/* ParameterStatus */
+	case PqMsg_ParameterStatus:
 		break;
-	case 'Z':	/* ReadyForQuery */
+	case PqMsg_ReadyForQuery:
 		sbuf_prepare_skip(&client->link->sbuf, pkt->len);
 		if (!client->login_user_credentials) {
 			if (cf_log_connections)
@@ -620,7 +743,8 @@ bool handle_auth_query_response(PgSocket *client, PktHdr *pkt)
 		if (server->state == SV_FREE || server->state == SV_JUSTFREE)
 			return false;
 		return true;
-	case 'E':	/* ErrorResponse */
+	case PqMsg_ErrorResponse:
+		log_server_error("S: error in auth_query", pkt);
 		disconnect_server(server, false, "error response from auth_query");
 		return false;
 	default:
@@ -695,7 +819,12 @@ static bool set_startup_options(PgSocket *client, const char *options)
 		 * GUC_REPORT flag, specifically extra_float_digits which is a
 		 * configuration that is set by CREATE SUBSCRIPTION in the
 		 * options parameter.
+		 *
+		 * First free it, because set_startup_options might be called
+		 * multiple times in some cases. One of these being when
+		 * auth_user is enabled.
 		 */
+		free(client->startup_options);
 		client->startup_options = strdup(options);
 		if (!client->startup_options)
 			disconnect_client(client, true, "out of memory");
@@ -901,8 +1030,11 @@ static bool decide_startup_pool(PgSocket *client, PktHdr *pkt)
 			unsupported_protocol_extensions.write_pos
 			);
 		res = pktbuf_send_immediate(buf, client);
-		if (!res)
+		if (!res) {
+			pktbuf_free(buf);
 			disconnect_client(client, false, "unable to send protocol negotiation packet");
+			return false;
+		}
 	}
 
 	/* find pool */
@@ -946,8 +1078,8 @@ static bool scram_client_first(PgSocket *client, uint32_t datalen, const uint8_t
 		goto failed;
 	slog_debug(client, "SCRAM server-first-message = \"%s\"", client->scram_state.server_first_message);
 
-	SEND_generic(res, client, 'R', "ib",
-		     AUTH_SASL_CONT,
+	SEND_generic(res, client, PqMsg_AuthenticationRequest, "ib",
+		     AUTH_REQ_SASL_CONT,
 		     client->scram_state.server_first_message,
 		     strlen(client->scram_state.server_first_message));
 
@@ -998,8 +1130,8 @@ static bool scram_client_final(PgSocket *client, uint32_t datalen, const uint8_t
 		goto failed;
 	slog_debug(client, "SCRAM server-final-message = \"%s\"", server_final_message);
 
-	SEND_generic(res, client, 'R', "ib",
-		     AUTH_SASL_FIN,
+	SEND_generic(res, client, PqMsg_AuthenticationRequest, "ib",
+		     AUTH_REQ_SASL_FIN,
 		     server_final_message,
 		     strlen(server_final_message));
 
@@ -1106,7 +1238,7 @@ static bool handle_client_startup(PgSocket *client, PktHdr *pkt)
 			return false;
 		}
 
-		if (client->pool && !client->wait_for_user_conn && !client->wait_for_user) {
+		if (client->pool && !sending_auth_query(client)) {
 			disconnect_client(client, true, "client re-sent startup pkt");
 			return false;
 		}
@@ -1120,14 +1252,14 @@ static bool handle_client_startup(PgSocket *client, PktHdr *pkt)
 		}
 
 		break;
-	case 'p':		/* PasswordMessage, SASLInitialResponse, or SASLResponse */
+	case PqMsg_PasswordMessage:	/* or SASLInitialResponse, or SASLResponse */
 		/* too early */
 		if (!client->login_user_credentials) {
 			disconnect_client(client, true, "client password pkt before startup packet");
 			return false;
 		}
 
-		if (client->client_auth_type == AUTH_SCRAM_SHA_256) {
+		if (client->client_auth_type == AUTH_TYPE_SCRAM_SHA_256) {
 			const char *mech;
 			uint32_t length;
 			const uint8_t *data;
@@ -1188,7 +1320,7 @@ static bool handle_client_startup(PgSocket *client, PktHdr *pkt)
 					return false;
 				}
 
-				if (client->client_auth_type == AUTH_PAM) {
+				if (client->client_auth_type == AUTH_TYPE_PAM) {
 					if (!sbuf_pause(&client->sbuf)) {
 						disconnect_client(client, true, "pause failed");
 						return false;
@@ -1237,28 +1369,28 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 
 	switch (pkt->type) {
 	/* one-packet queries */
-	case 'Q':		/* Query */
+	case PqMsg_Query:
 		if (cf_disable_pqexec) {
-			slog_error(client, "client used 'Q' packet type");
+			slog_error(client, "client used \"Query\" packet type");
 			disconnect_client(client, true, "PQexec disallowed");
 			return false;
 		}
 		track_outstanding = true;
 		break;
-	case 'F':		/* FunctionCall */
+	case PqMsg_FunctionCall:
 		track_outstanding = true;
 		break;
 
 	/* request immediate response from server */
-	case 'S':		/* Sync */
+	case PqMsg_Sync:
 		track_outstanding = true;
 		break;
-	case 'H':		/* Flush */
+	case PqMsg_Flush:
 		break;
 
 	/* copy end markers */
-	case 'c':		/* CopyDone(F/B) */
-	case 'f':		/* CopyFail(F/B) */
+	case PqMsg_CopyDone:
+	case PqMsg_CopyFail:
 		track_outstanding = true;
 		break;
 
@@ -1266,7 +1398,7 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 	 * extended protocol allows server (and thus pooler)
 	 * to buffer packets until sync or flush is sent by client
 	 */
-	case 'P':		/* Parse */
+	case PqMsg_Parse:
 		track_outstanding = true;
 		if (is_prepared_statements_enabled(client)) {
 			ps_action = inspect_parse_packet(client, pkt);
@@ -1274,11 +1406,11 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 		}
 		break;
 
-	case 'E':		/* Execute */
+	case PqMsg_Execute:
 		track_outstanding = true;
 		break;
 
-	case 'C':		/* Close */
+	case PqMsg_Close:
 		track_outstanding = true;
 		if (is_prepared_statements_enabled(client)) {
 			ps_action = inspect_describe_or_close_packet(client, pkt);
@@ -1286,7 +1418,7 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 		}
 		break;
 
-	case 'B':		/* Bind */
+	case PqMsg_Bind:
 		track_outstanding = true;
 		if (is_prepared_statements_enabled(client)) {
 			ps_action = inspect_bind_packet(client, pkt);
@@ -1294,7 +1426,7 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 		}
 		break;
 
-	case 'D':		/* Describe */
+	case PqMsg_Describe:
 		track_outstanding = true;
 		if (is_prepared_statements_enabled(client)) {
 			ps_action = inspect_describe_or_close_packet(client, pkt);
@@ -1302,7 +1434,7 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 		}
 		break;
 
-	case 'd':		/* CopyData(F/B) */
+	case PqMsg_CopyData:
 		break;
 
 	/* client wants to go away */
@@ -1310,7 +1442,7 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 		slog_error(client, "unknown pkt from client: %u/0x%x", pkt->type, pkt->type);
 		disconnect_client(client, true, "unknown pkt");
 		return false;
-	case 'X':	/* Terminate */
+	case PqMsg_Terminate:
 		disconnect_client(client, false, "client close request");
 		return false;
 	}
@@ -1375,7 +1507,7 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 		return false;
 	}
 
-	if (ps_action != PS_IGNORE && pkt->type == 'C') {
+	if (ps_action != PS_IGNORE && pkt->type == PqMsg_Close) {
 		if (!unmarshall_close_packet(client, pkt, &close_packet))
 			return false;
 
@@ -1429,11 +1561,11 @@ static bool handle_client_work(PgSocket *client, PktHdr *pkt)
 
 		switch (pkt->type)
 		{
-		case 'P':
+		case PqMsg_Parse:
 			return handle_parse_command(client, pkt);
-		case 'B':
+		case PqMsg_Bind:
 			return handle_bind_command(client, pkt);
-		case 'D':
+		case PqMsg_Describe:
 			return handle_describe_command(client, pkt);
 		}
 		return true;

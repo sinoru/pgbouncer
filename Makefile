@@ -60,6 +60,7 @@ pgbouncer_SOURCES = \
 	include/common/builtins.h \
 	include/common/pg_wchar.h \
 	include/common/postgres_compat.h \
+	include/common/protocol.h \
 	include/common/saslprep.h \
 	include/common/scram-common.h \
 	include/common/unicode_combining_table.h \
@@ -193,8 +194,8 @@ lint:
 	flake8
 
 format-check: uncrustify
-	black --check .
-	isort --check .
+	black --check --diff .
+	isort --check --diff .
 	./uncrustify -c uncrustify.cfg --check include/*.h src/*.c -L WARN
 
 format: uncrustify

@@ -21,25 +21,23 @@ int cf_listen_port;
 static const char *method2string(int method)
 {
 	switch (method) {
-	case AUTH_TRUST:
+	case AUTH_TYPE_TRUST:
 		return "trust";
-	case AUTH_PLAIN:
+	case AUTH_TYPE_PLAIN:
 		return "password";
-	case AUTH_CRYPT:
-		return "crypt";
-	case AUTH_MD5:
+	case AUTH_TYPE_MD5:
 		return "md5";
-	case AUTH_CERT:
+	case AUTH_TYPE_CERT:
 		return "cert";
-	case AUTH_PEER:
+	case AUTH_TYPE_PEER:
 		return "peer";
-	case AUTH_HBA:
+	case AUTH_TYPE_HBA:
 		return "hba";
-	case AUTH_REJECT:
+	case AUTH_TYPE_REJECT:
 		return "reject";
-	case AUTH_PAM:
+	case AUTH_TYPE_PAM:
 		return "pam";
-	case AUTH_SCRAM_SHA_256:
+	case AUTH_TYPE_SCRAM_SHA_256:
 		return "scram-sha-256";
 	default:
 		return "???";
@@ -79,8 +77,8 @@ static int hba_test_eval(struct HBA *hba, char *ln, int linenr)
 	user = get_token(&ln);
 	addr = get_token(&ln);
 	modifier = get_token(&ln);
-	tls = strings_equal(modifier, "tls");
-	replication = strings_equal(modifier, "replication") ?  REPLICATION_PHYSICAL : REPLICATION_NONE;
+	tls = strcmpeq(modifier, "tls");
+	replication = strcmpeq(modifier, "replication") ?  REPLICATION_PHYSICAL : REPLICATION_NONE;
 	if (!exp)
 		return 0;
 	if (!db || !user)
