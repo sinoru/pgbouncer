@@ -210,7 +210,7 @@ bool varcache_apply(PgSocket *server, PgSocket *client, bool *changes_p)
 	int sql_ofs;
 	struct PktBuf *pkt = pktbuf_temp();
 
-	pktbuf_start_packet(pkt, 'Q');
+	pktbuf_start_packet(pkt, PqMsg_Query);
 
 	/* grab query position inside pkt */
 	sql_ofs = pktbuf_written(pkt);
@@ -247,6 +247,21 @@ void varcache_set_canonical(PgSocket *server, PgSocket *client)
 			strpool_decref(client_val);
 			client->vars.var_list[lk->idx] = server_val;
 		}
+	}
+}
+
+void varcache_apply_startup(PktBuf *pkt, PgSocket *client)
+{
+	const struct var_lookup *lk, *tmp;
+
+	HASH_ITER(hh, lookup_map, lk, tmp) {
+		struct PStr *val = get_value(&client->vars, lk);
+		if (!val)
+			continue;
+
+		slog_debug(client, "varcache_apply_startup: %s=%s", lk->name, val->str);
+		pktbuf_put_string(pkt, lk->name);
+		pktbuf_put_string(pkt, val->str);
 	}
 }
 

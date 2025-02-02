@@ -5,7 +5,7 @@ import time
 import psycopg
 import pytest
 
-from .utils import HAVE_IPV6_LOCALHOST, PG_MAJOR_VERSION, WINDOWS
+from .utils import HAVE_IPV6_LOCALHOST, PG_MAJOR_VERSION, PKT_BUF_SIZE, WINDOWS
 
 
 def test_connect_query(bouncer):
@@ -165,6 +165,13 @@ def test_options_startup_param(bouncer):
 
     assert (
         bouncer.sql_value(
+            "SHOW timezone", options="--timezone=Portugal  --datestyle=German,\\ YMD"
+        )
+        == "Portugal"
+    )
+
+    assert (
+        bouncer.sql_value(
             "SHOW timezone",
             options="-c t\\imezone=\\P\\o\\r\\t\\ugal  -c    dat\\estyle\\=\\Ge\\rman,\\ YMD",
         )
@@ -180,23 +187,15 @@ def test_options_startup_param(bouncer):
 
     with pytest.raises(
         psycopg.OperationalError,
-        match="unsupported options startup parameter: only '-c config=val' is allowed",
+        match="unsupported options startup parameter: only '-c config=val' and '--config=val' are allowed",
     ):
         bouncer.test(options="-d")
 
     with pytest.raises(
         psycopg.OperationalError,
-        match="unsupported options startup parameter: only '-c config=val' is allowed",
+        match="unsupported options startup parameter: only '-c config=val' and '--config=val' are allowed",
     ):
         bouncer.test(options="-c timezone")
-
-    too_long_param = "a" * 1000
-
-    with pytest.raises(
-        psycopg.OperationalError,
-        match="unsupported options startup parameter: parameter too long",
-    ):
-        bouncer.test(options="-c timezone=" + too_long_param)
 
     with pytest.raises(
         psycopg.OperationalError,
@@ -225,6 +224,11 @@ def test_options_startup_param(bouncer):
     )
 
 
+def test_startup_packet_larger_than_pktbuf(bouncer):
+    long_string = "1" * PKT_BUF_SIZE
+    bouncer.test(options=f"-c extra_float_digits={long_string}")
+
+
 def test_empty_application_name(bouncer):
     with bouncer.cur(dbname="p1", application_name="") as cur:
         assert cur.execute("SHOW application_name").fetchone()[0] == ""
@@ -250,3 +254,140 @@ def test_equivalent_startup_param(bouncer):
         ):
             cur.execute("SELECT 1")
             cur.execute("SELECT 1")
+
+
+@pytest.mark.skipif("WINDOWS", reason="Windows doesn't support sending SIGTERM")
+async def test_repeated_sigterm(bouncer):
+    with bouncer.cur() as cur:
+        cur.execute("SELECT 1")
+        bouncer.sigterm()
+
+        # Single sigterm should wait for clients
+        time.sleep(1)
+        cur.execute("SELECT 1")
+        assert bouncer.running()
+
+        # Second sigterm should cause fast exit
+        bouncer.sigterm()
+        await bouncer.wait_for_exit()
+        with pytest.raises(
+            psycopg.OperationalError, match="server closed the connection unexpectedly"
+        ):
+            cur.execute("SELECT 1")
+        assert not bouncer.running()
+
+
+@pytest.mark.skipif("WINDOWS", reason="Windows doesn't support sending SIGINT")
+async def test_repeated_sigint(bouncer):
+    bouncer.admin(f"set pool_mode=session")
+    with bouncer.cur() as cur:
+        cur.execute("SELECT 1")
+        bouncer.sigint()
+
+        # Single sigint should wait for servers to be released
+        time.sleep(1)
+        cur.execute("SELECT 1")
+        assert bouncer.running()
+
+        # But new clients should be rejected, because we stopped listening for
+        # new connections.
+        with pytest.raises(psycopg.OperationalError, match="Connection refused"):
+            bouncer.test()
+
+        # Second sigint should cause fast exit
+        bouncer.sigint()
+        await bouncer.wait_for_exit()
+        with pytest.raises(
+            psycopg.OperationalError, match="server closed the connection unexpectedly"
+        ):
+            cur.execute("SELECT 1")
+        assert not bouncer.running()
+
+
+def test_newly_paused_client_during_wait_for_servers_shutdown(bouncer):
+    bouncer.admin(f"set pool_mode=transaction")
+    with bouncer.transaction() as cur1, bouncer.cur() as cur2:
+        cur1.execute("SELECT 1")
+        bouncer.admin("SHUTDOWN WAIT_FOR_SERVERS")
+        # Still in the same transaction, so this should work
+        cur1.execute("SELECT 1")
+        # New transaction so this should fail
+        with bouncer.log_contains(r"closing because: server shutting down"):
+            with pytest.raises(psycopg.OperationalError):
+                cur2.execute("SELECT 1")
+
+
+async def test_already_paused_client_during_wait_for_servers_shutdown(bouncer):
+    bouncer.admin(f"set pool_mode=transaction")
+    bouncer.admin(f"set default_pool_size=1")
+    bouncer.default_db = "p1"
+    with bouncer.transaction() as cur1:
+        conn2 = await bouncer.aconn()
+        cur2 = conn2.cursor()
+
+        cur1.execute("SELECT 1")
+        # start the request before the shutdown
+        task = asyncio.ensure_future(cur2.execute("SELECT 1"))
+        # We wait for one second so that the client goes to CL_WAITING state
+        done, pending = await asyncio.wait([task], timeout=1)
+        assert done == set()
+        assert pending == {task}
+        bouncer.admin("SHUTDOWN WAIT_FOR_SERVERS")
+        # Still in the same transaction, so this should work
+        cur1.execute("SELECT 1")
+        # New transaction so this should fail
+        with bouncer.log_contains(r"closing because: server shutting down"):
+            with pytest.raises(psycopg.OperationalError):
+                await task
+
+
+def test_resume_during_shutdown(bouncer):
+    with bouncer.cur() as cur, bouncer.admin_runner.cur() as admin_cur:
+        cur.execute("SELECT 1")
+        bouncer.admin("SHUTDOWN WAIT_FOR_CLIENTS")
+
+        with pytest.raises(
+            psycopg.errors.ProtocolViolation, match="pooler is shutting down"
+        ):
+            admin_cur.execute("RESUME")
+
+
+def test_sigusr2_during_shutdown(bouncer):
+    with bouncer.cur() as cur:
+        cur.execute("SELECT 1")
+        bouncer.admin("SHUTDOWN WAIT_FOR_CLIENTS")
+
+        if not WINDOWS:
+            with bouncer.log_contains(r"got SIGUSR2 while shutting down, ignoring"):
+                bouncer.sigusr2()
+                time.sleep(1)
+
+
+def test_issue_1104(bouncer):
+    # regression test for GitHub issue #1104 [PgCredentials objects are freed incorrectly]
+
+    for i in range(1, 15):
+        config = """
+            [databases]
+        """
+
+        for j in range(1, 10 * i):
+            config += f"""
+                testdb_{i}_{j} = host={bouncer.pg.host} port={bouncer.pg.port} user=dummy_user_{i}_{j}
+            """
+
+        config += f"""
+            [pgbouncer]
+            listen_addr = {bouncer.host}
+            listen_port = {bouncer.port}
+
+            auth_type = trust
+            auth_file = {bouncer.auth_path}
+
+            admin_users = pgbouncer
+
+            logfile = {bouncer.log_path}
+        """
+
+        with bouncer.run_with_config(config):
+            bouncer.admin("RELOAD")

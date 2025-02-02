@@ -21,6 +21,7 @@
  */
 
 #include "bouncer.h"
+#include "usual/time.h"
 
 #include <usual/fileutil.h>
 #include <usual/string.h>
@@ -28,6 +29,9 @@
 /*
  * ConnString parsing
  */
+
+bool any_user_level_timeout_set;
+bool any_user_level_client_timeout_set;
 
 /* parse parameter name before '=' */
 static char *cstr_get_key(char *p, char **dst_p)
@@ -121,25 +125,11 @@ static char * cstr_get_pair(char *p,
 }
 
 /*
- * Same as strcmp, but handles NULLs. If both sides are NULL, returns "true".
- */
-static bool strings_equal(const char *str_left, const char *str_right)
-{
-	if (str_left == NULL && str_right == NULL)
-		return true;
-
-	if (str_left == NULL || str_right == NULL)
-		return false;
-
-	return strcmp(str_left, str_right) == 0;
-}
-
-/*
  * Free the old value and set the new value
  */
 static bool set_param_value(char **old_value, const char *new_value)
 {
-	if (strings_equal(*old_value, new_value))
+	if (strcmpeq(*old_value, new_value))
 		return true;
 
 	if (*old_value)
@@ -211,11 +201,8 @@ bool parse_peer(void *base, const char *name, const char *connstr)
 		}
 
 		if (strcmp("host", key) == 0) {
-			host = strdup(val);
-			if (!host) {
-				log_error("out of memory");
+			if (!set_param_value(&host, val))
 				goto fail;
-			}
 		} else if (strcmp("port", key) == 0) {
 			port = atoi(val);
 			if (port == 0) {
@@ -253,6 +240,7 @@ bool parse_peer(void *base, const char *name, const char *connstr)
 	return true;
 fail:
 	free(tmp_connstr);
+	free(host);
 	return false;
 }
 /* fill PgDatabase from connstr */
@@ -262,12 +250,16 @@ bool parse_database(void *base, const char *name, const char *connstr)
 	PktBuf *msg;
 	PgDatabase *db;
 	struct CfValue cv;
+	struct CfValue load_balance_hosts_lookup;
 	int pool_size = -1;
 	int min_pool_size = -1;
 	int res_pool_size = -1;
+	int max_db_client_connections = -1;
 	int max_db_connections = -1;
+	usec_t server_lifetime = 0;
 	int dbname_ofs;
 	int pool_mode = POOL_INHERIT;
+	enum LoadBalanceHosts load_balance_hosts = LOAD_BALANCE_HOSTS_ROUND_ROBIN;
 
 	char *tmp_connstr;
 	const char *dbname = name;
@@ -286,6 +278,9 @@ bool parse_database(void *base, const char *name, const char *connstr)
 
 	cv.value_p = &pool_mode;
 	cv.extra = (const void *)pool_mode_map;
+
+	load_balance_hosts_lookup.value_p = &load_balance_hosts;
+	load_balance_hosts_lookup.extra = (const void *)load_balance_hosts_map;
 
 	if (!check_reserved_database(name)) {
 		log_error("database name \"%s\" is reserved", name);
@@ -315,11 +310,8 @@ bool parse_database(void *base, const char *name, const char *connstr)
 		if (strcmp("dbname", key) == 0) {
 			dbname = val;
 		} else if (strcmp("host", key) == 0) {
-			host = strdup(val);
-			if (!host) {
-				log_error("out of memory");
+			if (!set_param_value(&host, val))
 				goto fail;
-			}
 		} else if (strcmp("port", key) == 0) {
 			port = atoi(val);
 			if (port == 0) {
@@ -345,20 +337,29 @@ bool parse_database(void *base, const char *name, const char *connstr)
 		} else if (strcmp("min_pool_size", key) == 0) {
 			min_pool_size = atoi(val);
 		} else if (strcmp("reserve_pool", key) == 0) {
+			/* We continue supporting this option for backwards compatibility */
+			res_pool_size = atoi(val);
+		} else if (strcmp("reserve_pool_size", key) == 0) {
 			res_pool_size = atoi(val);
 		} else if (strcmp("max_db_connections", key) == 0) {
 			max_db_connections = atoi(val);
+		} else if (strcmp("max_db_client_connections", key) == 0) {
+			max_db_client_connections = atoi(val);
+		} else if (strcmp("server_lifetime", key) == 0) {
+			server_lifetime = atoi(val) * USEC;
+		} else if (strcmp("load_balance_hosts", key) == 0) {
+			if (!cf_set_lookup(&load_balance_hosts_lookup, val)) {
+				log_error("invalid load_balance_hosts: %s", val);
+				goto fail;
+			}
 		} else if (strcmp("pool_mode", key) == 0) {
 			if (!cf_set_lookup(&cv, val)) {
 				log_error("invalid pool mode: %s", val);
 				goto fail;
 			}
 		} else if (strcmp("connect_query", key) == 0) {
-			connect_query = strdup(val);
-			if (!connect_query) {
-				log_error("out of memory");
+			if (!set_param_value(&connect_query, val))
 				goto fail;
-			}
 		} else if (strcmp("application_name", key) == 0) {
 			appname = val;
 		} else if (strcmp("auth_query", key) == 0) {
@@ -386,21 +387,23 @@ bool parse_database(void *base, const char *name, const char *connstr)
 		bool changed = false;
 		if (strcmp(db->dbname, dbname) != 0) {
 			changed = true;
-		} else if (!strings_equal(host, db->host)) {
+		} else if (!strcmpeq(host, db->host)) {
 			changed = true;
 		} else if (port != db->port) {
 			changed = true;
-		} else if (username && !db->forced_user) {
+		} else if (username && !db->forced_user_credentials) {
 			changed = true;
-		} else if (username && strcmp(username, db->forced_user->name) != 0) {
+		} else if (username && strcmp(username, db->forced_user_credentials->name) != 0) {
 			changed = true;
-		} else if (!username && db->forced_user) {
+		} else if (!username && db->forced_user_credentials) {
 			changed = true;
-		} else if (!strings_equal(connect_query, db->connect_query)) {
+		} else if (!strcmpeq(connect_query, db->connect_query)) {
 			changed = true;
-		} else if (!strings_equal(db->auth_dbname, auth_dbname)) {
+		} else if (!strcmpeq(db->auth_dbname, auth_dbname)) {
 			changed = true;
-		} else if (!strings_equal(db->auth_query, auth_query)) {
+		} else if (!strcmpeq(db->auth_query, auth_query)) {
+			changed = true;
+		} else if (load_balance_hosts != db->load_balance_hosts) {
 			changed = true;
 		}
 		if (changed)
@@ -409,14 +412,19 @@ bool parse_database(void *base, const char *name, const char *connstr)
 
 	free(db->host);
 	db->host = host;
+	host = NULL;
 	db->port = port;
 	db->pool_size = pool_size;
 	db->min_pool_size = min_pool_size;
 	db->res_pool_size = res_pool_size;
 	db->pool_mode = pool_mode;
+	db->max_db_client_connections = max_db_client_connections;
 	db->max_db_connections = max_db_connections;
+	db->server_lifetime = server_lifetime;
+	db->load_balance_hosts = load_balance_hosts;
 	free(db->connect_query);
 	db->connect_query = connect_query;
+	connect_query = NULL;
 
 	if (!set_param_value(&db->auth_dbname, auth_dbname))
 		goto fail;
@@ -459,19 +467,18 @@ bool parse_database(void *base, const char *name, const char *connstr)
 	}
 
 	if (auth_username != NULL) {
-		db->auth_user = find_user(auth_username);
-		if (!db->auth_user) {
-			db->auth_user = add_user(auth_username, "");
-		}
-	} else if (db->auth_user) {
-		db->auth_user = NULL;
+		db->auth_user_credentials = find_or_add_new_global_credentials(auth_username, "");
+		if (!db->auth_user_credentials)
+			goto fail;
+	} else if (db->auth_user_credentials) {
+		db->auth_user_credentials = NULL;
 	}
 
 	/* if user is forced, create fake object for it */
 	if (username != NULL) {
-		if (!force_user(db, username, password))
+		if (!force_user_credentials(db, username, password))
 			log_warning("db setup failed, trying to continue");
-	} else if (db->forced_user) {
+	} else if (db->forced_user_credentials) {
 		log_warning("losing forced user not supported,"
 			    " keeping old setting");
 	}
@@ -483,17 +490,24 @@ bool parse_database(void *base, const char *name, const char *connstr)
 	return true;
 fail:
 	free(tmp_connstr);
+	free(host);
+	free(connect_query);
 	return false;
 }
 
 bool parse_user(void *base, const char *name, const char *connstr)
 {
 	char *p, *key, *val, *tmp_connstr;
-	PgUser *user;
+	PgGlobalUser *user;
 	struct CfValue cv;
 	int pool_mode = POOL_INHERIT;
+	int pool_size = -1;
+	int res_pool_size = -1;
 	int max_user_connections = -1;
-
+	usec_t idle_transaction_timeout = 0;
+	usec_t query_timeout = 0;
+	usec_t client_idle_timeout = 0;
+	int max_user_client_connections = -1;
 
 	cv.value_p = &pool_mode;
 	cv.extra = (const void *)pool_mode_map;
@@ -519,25 +533,43 @@ bool parse_user(void *base, const char *name, const char *connstr)
 				log_error("invalid pool mode: %s", val);
 				goto fail;
 			}
+		} else if (strcmp("pool_size", key) == 0) {
+			pool_size = atoi(val);
+		} else if (strcmp("reserve_pool_size", key) == 0) {
+			res_pool_size = atoi(val);
 		} else if (strcmp("max_user_connections", key) == 0) {
 			max_user_connections = atoi(val);
+		} else if (strcmp("idle_transaction_timeout", key) == 0) {
+			any_user_level_timeout_set = true;
+			idle_transaction_timeout = atoi(val) * USEC;
+		} else if (strcmp("query_timeout", key) == 0) {
+			any_user_level_timeout_set = true;
+			query_timeout = atoi(val) * USEC;
+		} else if (strcmp("client_idle_timeout", key) == 0) {
+			any_user_level_client_timeout_set = true;
+			client_idle_timeout = atoi(val) * USEC;
+		} else if (strcmp("max_user_client_connections", key) == 0) {
+			max_user_client_connections = atoi(val);
 		} else {
 			log_error("unrecognized user parameter: %s", key);
 			goto fail;
 		}
 	}
 
-	user = find_user(name);
+	user = find_or_add_new_global_user(name, "");
 	if (!user) {
-		user = add_user(name, "");
-		if (!user) {
-			log_error("cannot create user, no memory?");
-			goto fail;
-		}
+		log_error("cannot create user, no memory?");
+		goto fail;
 	}
 
 	user->pool_mode = pool_mode;
+	user->pool_size = pool_size;
+	user->res_pool_size = res_pool_size;
 	user->max_user_connections = max_user_connections;
+	user->idle_transaction_timeout = idle_transaction_timeout;
+	user->query_timeout = query_timeout;
+	user->client_idle_timeout = client_idle_timeout;
+	user->max_user_client_connections = max_user_client_connections;
 
 	free(tmp_connstr);
 	return true;
@@ -577,18 +609,28 @@ static void copy_quoted(char *dst, const char *src, int len)
 	*dst = 0;
 }
 
-static void unquote_add_user(const char *username, const char *password)
+/* This function is only called when parsing the auth file, so
+   all users added by this function do not have a dynamic password,
+   by definition. If the password is empty, so be it. */
+static void unquote_add_authfile_user(const char *username, const char *password)
 {
 	char real_user[MAX_USERNAME];
 	char real_passwd[MAX_PASSWORD];
-	PgUser *user;
+	PgGlobalUser *user;
 
 	copy_quoted(real_user, username, sizeof(real_user));
 	copy_quoted(real_passwd, password, sizeof(real_passwd));
 
-	user = add_user(real_user, real_passwd);
-	if (!user)
+	user = find_or_add_new_global_user(real_user, real_passwd);
+	if (!user) {
 		log_warning("cannot create user, no memory");
+		return;
+	}
+	if (strcmp(user->credentials.passwd, real_passwd) != 0) {
+		user = update_global_user_passwd(user, real_passwd);
+	}
+
+	user->credentials.dynamic_passwd = false;
 }
 
 static bool auth_loaded(const char *fn)
@@ -630,12 +672,11 @@ bool loader_users_check(void)
 
 static void disable_users(void)
 {
-	PgUser *user;
 	struct List *item;
 
 	statlist_for_each(item, &user_list) {
-		user = container_of(item, PgUser, head);
-		user->passwd[0] = 0;
+		PgGlobalUser *user = container_of(item, PgGlobalUser, head);
+		user->credentials.passwd[0] = 0;
 	}
 }
 
@@ -706,7 +747,7 @@ bool load_auth_file(const char *fn)
 		*p++ = 0;	/* tag password end */
 
 		/* send them away */
-		unquote_add_user(user, password);
+		unquote_add_authfile_user(user, password);
 
 		/* skip rest of the line */
 		while (*p && *p != '\n') p++;

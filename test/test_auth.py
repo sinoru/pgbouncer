@@ -1,10 +1,56 @@
+import getpass
 import re
+import subprocess
 import time
 
 import psycopg
 import pytest
 
-from .utils import LONG_PASSWORD, PG_SUPPORTS_SCRAM, WINDOWS
+from .utils import (
+    FREEBSD,
+    LONG_PASSWORD,
+    MACOS,
+    PG_SUPPORTS_SCRAM,
+    TLS_SUPPORT,
+    WINDOWS,
+)
+
+
+@pytest.fixture
+def test_message_fixture(bouncer, pg):
+    yield bouncer, pg
+    pg.sql("ALTER USER test_error_message_user WITH LOGIN;")
+
+
+@pytest.mark.skipif("FREEBSD", reason="FreeBSD error reporting broken")
+@pytest.mark.skipif("WINDOWS", reason="Windows error reporting broken")
+def test_message(test_message_fixture):
+    bouncer, pg = test_message_fixture
+    test_user = "test_error_message_user"
+    connection_params = {"user": test_user, "dbname": "p0a"}
+    # Connect to database as User, creates existing pool
+    _ = bouncer.conn(**connection_params)
+
+    # Change user to nologin
+    pg.sql(f"ALTER USER {test_user} WITH NOLOGIN;")
+
+    # Kill process on postgres
+    terminate_string = f"""
+    SELECT pg_terminate_backend(pid)
+    FROM pg_stat_activity
+    WHERE
+      pid <> pg_backend_pid()
+      AND usename = '{test_user}'
+    """
+    pg.sql(terminate_string)
+
+    # login, check error message
+    # login again, check error message
+    for _ in range(2):
+        with pytest.raises(
+            psycopg.OperationalError, match=r"is not permitted to log in"
+        ):
+            bouncer.test(**connection_params)
 
 
 @pytest.mark.md5
@@ -29,6 +75,7 @@ def test_auth_dbname_global(bouncer):
     bouncer.admin(f"set auth_type='md5'")
 
     bouncer.test(dbname="p7a", user="someuser", password="anypasswd")
+    bouncer.test(dbname="p7a", user="pswcheck", password="pgbouncer-check")
 
 
 @pytest.mark.md5
@@ -74,6 +121,7 @@ def test_auth_dbname_with_auto_database(bouncer):
     bouncer.admin(f"set auth_type='md5'")
     # postgres is not defined in test.ini
     bouncer.test(dbname="postgres", user="someuser", password="anypasswd")
+    bouncer.test(dbname="postgres", user="pswcheck", password="pgbouncer-check")
 
 
 @pytest.mark.md5
@@ -405,6 +453,119 @@ def test_auth_query_database_setting(
 
 
 @pytest.mark.skipif("WINDOWS", reason="Windows does not have SIGHUP")
+def test_auth_query_works_with_configured_users(bouncer):
+    """
+    Check that when a user is configured with per-user options, but missing from auth_file
+    pgBouncer will still attempt to valididate passwords if auth_query is configured.
+    """
+
+    config = f"""
+        [databases]
+        postgres = host={bouncer.pg.host} port={bouncer.pg.port}
+        [pgbouncer]
+        auth_query = SELECT usename, passwd FROM pg_shadow where usename = $1
+        auth_user = pswcheck
+        stats_users = stats
+        listen_addr = {bouncer.host}
+        admin_users = pgbouncer
+        auth_type = md5
+        auth_file = {bouncer.auth_path}
+        listen_port = {bouncer.port}
+        logfile = {bouncer.log_path}
+        auth_dbname = postgres
+        pool_mode = session
+        [users]
+        puser1 = pool_mode=statement
+    """
+
+    # As a sanity check, make sure that a user with a password in auth_file cannot run transactions
+    # while configured to be in statement pooling mode
+    with bouncer.run_with_config(config):
+        with pytest.raises(psycopg.OperationalError):
+            with bouncer.log_contains(
+                "closing because: transaction blocks not allowed in statement pooling mode"
+            ):
+                bouncer.sql(
+                    query="begin",
+                    user="puser1",
+                    password="foo",
+                    dbname="postgres",
+                )
+
+    config = f"""
+        [databases]
+        postgres = host={bouncer.pg.host} port={bouncer.pg.port}
+        [pgbouncer]
+        auth_query = SELECT usename, passwd FROM pg_shadow where usename = $1
+        auth_user = pswcheck
+        stats_users = stats
+        listen_addr = {bouncer.host}
+        admin_users = pgbouncer
+        auth_type = md5
+        auth_file = {bouncer.auth_path}
+        listen_port = {bouncer.port}
+        logfile = {bouncer.log_path}
+        auth_dbname = postgres
+        pool_mode = session
+        [users]
+        stats = pool_mode=statement
+    """
+
+    # While pgbouncer is set to use session mode by default, the stats user
+    # is set to use statement pooling. pgBouncer should fail to allow a begin
+    # statement while in statement pooling mode, but still be able to authenticate
+    # using auth_query.
+    with bouncer.run_with_config(config):
+        with pytest.raises(psycopg.OperationalError):
+            with bouncer.log_contains(
+                "closing because: transaction blocks not allowed in statement pooling mode"
+            ):
+                bouncer.sql(
+                    query="begin",
+                    user="stats",
+                    password="stats",
+                    dbname="postgres",
+                )
+
+
+@pytest.mark.skipif("WINDOWS", reason="Windows does not have SIGHUP")
+def test_auth_query_logs_server_error(
+    bouncer,
+):
+    """
+    Check that when the auth_query response has an error, pgbouncer logs
+    the error message provided by postgres.
+    """
+
+    config = f"""
+        [databases]
+        postgres = auth_query='SELECT usename, passwd FROM not_pg_shadow where usename = $1'\
+            host={bouncer.pg.host} port={bouncer.pg.port}
+        [pgbouncer]
+        auth_query = SELECT 1
+        auth_user = pswcheck
+        stats_users = stats
+        listen_addr = {bouncer.host}
+        admin_users = pgbouncer
+        auth_type = md5
+        auth_file = {bouncer.auth_path}
+        listen_port = {bouncer.port}
+        logfile = {bouncer.log_path}
+        auth_dbname = postgres
+    """
+
+    with bouncer.log_contains('"not_pg_shadow" does not exist'):
+        with bouncer.run_with_config(config):
+            with pytest.raises(psycopg.OperationalError, match="bouncer config error"):
+                bouncer.sql(
+                    query="select version()",
+                    user="stats",
+                    password="stats",
+                    dbname="postgres",
+                )
+
+
+@pytest.mark.skipif("WINDOWS", reason="Windows does not have SIGHUP")
 @pytest.mark.md5
 def test_auth_dbname_works_fine(
     bouncer,
@@ -517,7 +678,7 @@ async def test_change_server_password_reconnect(bouncer, pg):
             with pg.log_contains(
                 r"password authentication failed", times=1
             ), bouncer.log_contains(
-                r"closing because: password authentication failed for user", times=3
+                r"closing because: password authentication failed for user", times=4
             ):
                 result1 = bouncer.atest()
                 result2 = bouncer.atest()
@@ -539,6 +700,7 @@ async def test_change_server_password_reconnect(bouncer, pg):
                     psycopg.OperationalError, match="password authentication failed"
                 ):
                     await result3
+                time.sleep(3)
     finally:
         pg.sql("ALTER USER puser1 PASSWORD 'foo'")
 
@@ -562,7 +724,7 @@ async def test_change_server_password_server_lifetime(bouncer, pg):
         with pg.log_contains(
             r"password authentication failed", times=1
         ), bouncer.log_contains(
-            r"closing because: password authentication failed for user", times=3
+            r"closing because: password authentication failed for user", times=4
         ):
             result1 = bouncer.atest()
             result2 = bouncer.atest()
@@ -574,5 +736,368 @@ async def test_change_server_password_server_lifetime(bouncer, pg):
                 await result2
             with pytest.raises(psycopg.OperationalError):
                 await result3
+            time.sleep(3)
     finally:
         pg.sql("ALTER USER puser1 PASSWORD 'foo'")
+
+
+@pytest.mark.skipif("MACOS", reason="SSL tests are broken on OSX in CI #1031")
+@pytest.mark.skipif("WINDOWS", reason="Windows does not have SIGHUP")
+@pytest.mark.skipif(not TLS_SUPPORT, reason="pgbouncer is built without TLS support")
+def test_client_hba_cert(bouncer, cert_dir):
+    root = cert_dir / "TestCA1" / "ca.crt"
+    key = cert_dir / "TestCA1" / "sites" / "01-localhost.key"
+    cert = cert_dir / "TestCA1" / "sites" / "01-localhost.crt"
+
+    bouncer.write_ini(f"client_tls_key_file = {key}")
+    bouncer.write_ini(f"client_tls_cert_file = {cert}")
+    bouncer.write_ini(f"client_tls_ca_file = {root}")
+    bouncer.write_ini(f"client_tls_sslmode = require")
+    bouncer.write_ini(f"auth_type = hba")
+    bouncer.write_ini(
+        f"auth_query = SELECT usename, passwd FROM pg_shadow where usename = $1"
+    )
+    bouncer.write_ini(f"auth_user = pswcheck")
+    bouncer.write_ini(f"auth_file = {bouncer.auth_path}")
+    bouncer.write_ini(f"auth_hba_file = pgbouncer_hba.conf")
+    bouncer.write_ini(f"auth_ident_file = pgident.conf")
+
+    bouncer.admin("reload")
+
+    client_key = cert_dir / "TestCA1" / "sites" / "04-pgbouncer.acme.org.key"
+    client_cert = cert_dir / "TestCA1" / "sites" / "04-pgbouncer.acme.org.crt"
+
+    # The client connects to p0x using a client certificate with CN=pgbouncer.acme.org.
+    # hba_eval returns the following line:
+    #    hostssl p0x    all        0.0.0.0/0               cert    map=test
+    # where "test" map is defined in pgident.conf as
+    #    test            pgbouncer.acme.org      someuser
+    #    test            pgbouncer.acme.org      anotheruser
+    # hence the test succeeds.
+    bouncer.psql_test(
+        dbname="p0x",
+        host="localhost",
+        user="someuser",
+        sslmode="verify-full",
+        sslkey=client_key,
+        sslcert=client_cert,
+        sslrootcert=root,
+    )
+
+    bouncer.pg.sql("create user anotheruser with login;")
+
+    # The client connects to p0x using a client certificate with CN=pgbouncer.acme.org.
+    # hba_eval returns the following line:
+    #    hostssl p0x    all        0.0.0.0/0               cert    map=test
+    # where "test" map is defined in pgident.conf as
+    #    test            pgbouncer.acme.org      someuser
+    #    test            pgbouncer.acme.org      anotheruser
+    # hence the test succeeds.
+    bouncer.psql_test(
+        dbname="p0x",
+        host="localhost",
+        user="anotheruser",
+        sslmode="verify-full",
+        sslkey=client_key,
+        sslcert=client_cert,
+        sslrootcert=root,
+    )
+
+    # The client connects to p0x using a client certificate with CN=pgbouncer.acme.org.
+    # hba_eval returns the following line:
+    #    hostssl p0x    all        0.0.0.0/0               cert    map=test
+    # where "test" map is defined in pgident.conf as
+    #    test            pgbouncer.acme.org      someuser
+    #    test            pgbouncer.acme.org      anotheruser
+    # the username 'bouncer' does not match any mapped pg-username.
+    # hence the test fails.
+    with pytest.raises(
+        subprocess.CalledProcessError,
+    ):
+        with bouncer.log_contains(
+            "p0x/bouncer@127.0.0.1:43544 ident map: test does not have a match"
+        ):
+            bouncer.psql_test(
+                dbname="p0x",
+                host="localhost",
+                user="bouncer",
+                sslmode="verify-full",
+                sslkey=client_key,
+                sslcert=client_cert,
+                sslrootcert=root,
+            )
+
+    client_key = cert_dir / "TestCA1" / "sites" / "02-bouncer.key"
+    client_cert = cert_dir / "TestCA1" / "sites" / "02-bouncer.crt"
+
+    # The client connects to p0 using a client certificate with CN=bouncer.
+    # hba_eval returns the following line:
+    #    hostssl p0              bouncer         0.0.0.0/0               cert
+    # CN expected in map is "bouncer" which matches the CN in the client cert
+    # hence the test succeeds.
+    bouncer.psql_test(
+        dbname="p0",
+        host="localhost",
+        user="bouncer",
+        sslmode="verify-full",
+        sslkey=client_key,
+        sslcert=client_cert,
+        sslrootcert=root,
+    )
+
+    # The client connects to p0y using a client certificate with CN=bouncer.
+    # hba_eval returns the following line:
+    #    hostssl p0y             all             0.0.0.0/0               cert    map=test2
+    # where
+    #   test2           bouncer                 all
+    #   test2           pgbouncer.acme.org      "anotheruser"
+    # test2 mapping allows any client with CN="bouncer" to connect using any user name.
+    # Hence the test succeeds.
+    bouncer.psql_test(
+        dbname="p0y",
+        host="localhost",
+        user="someuser",
+        sslmode="verify-full",
+        sslkey=client_key,
+        sslcert=client_cert,
+        sslrootcert=root,
+    )
+
+    client_key = cert_dir / "TestCA1" / "sites" / "04-pgbouncer.acme.org.key"
+    client_cert = cert_dir / "TestCA1" / "sites" / "04-pgbouncer.acme.org.crt"
+
+    # The client connects to p0y using a client certificate with CN=pgbouncer.acme.org.
+    # hba_eval returns the following line:
+    #    hostssl p0y             all             0.0.0.0/0               cert    map=test2
+    # where
+    #   test2           bouncer                 all
+    #   test2           pgbouncer.acme.org      "anotheruser"
+    # for CN=pgbouncer.acme.org, test2 allows to use anotheruser. Hence the test fails.
+
+    with pytest.raises(
+        subprocess.CalledProcessError,
+    ):
+        with bouncer.log_contains(
+            "p0y/someuser@127.0.0.1:39712 ident map: test2 does not have a match"
+        ):
+            bouncer.psql_test(
+                dbname="p0y",
+                host="localhost",
+                user="someuser",
+                sslmode="verify-full",
+                sslkey=client_key,
+                sslcert=client_cert,
+                sslrootcert=root,
+            )
+
+    # The client connects to p0y using a client certificate with CN=pgbouncer.acme.org.
+    # hba_eval returns the following line:
+    #    hostssl p0y             all             0.0.0.0/0               cert    map=test2
+    # where
+    #   test2           bouncer                 all
+    #   test2           pgbouncer.acme.org      "anotheruser"
+    # for CN=pgbouncer.acme.org, test2 allows to use anotheruser. Hence the test succeeds.
+
+    bouncer.psql_test(
+        dbname="p0y",
+        host="localhost",
+        user="anotheruser",
+        sslmode="verify-full",
+        sslkey=client_key,
+        sslcert=client_cert,
+        sslrootcert=root,
+    )
+
+
+@pytest.mark.skipif("WINDOWS", reason="Windows does not have peer authentication")
+def test_peer_auth_ident_map(bouncer):
+    cur_user = getpass.getuser()
+
+    ident_conf_file = bouncer.config_dir / "ident.conf"
+    hba_conf_file = bouncer.config_dir / "hba.conf"
+
+    with open(ident_conf_file, "w") as f:
+        f.write(f"mymap {cur_user} postgres\n")
+        f.write(f"mymap {cur_user} someuser\n")
+
+    with open(hba_conf_file, "w") as f:
+        f.write(f"local   all  all peer map=mymap")
+
+    bouncer.write_ini(f"auth_type = hba")
+    bouncer.write_ini(
+        f"auth_query = SELECT usename, passwd FROM pg_shadow where usename = $1"
+    )
+    bouncer.write_ini(f"auth_user = pswcheck")
+    bouncer.write_ini(f"auth_file = {bouncer.auth_path}")
+    bouncer.write_ini(f"auth_hba_file = {hba_conf_file}")
+    bouncer.write_ini(f"auth_ident_file = {ident_conf_file}")
+
+    bouncer.admin("reload")
+
+    bouncer.psql_test(
+        dbname="p0y",
+        host=f"{bouncer.admin_host}",
+        user="postgres",
+    )
+
+    bouncer.psql_test(
+        dbname="p0y",
+        host=f"{bouncer.admin_host}",
+        user="someuser",
+    )
+
+    with pytest.raises(
+        subprocess.CalledProcessError,
+    ):
+        with bouncer.log_contains(
+            "p0y/bouncer@unix(6202):10202 ident map mymap cannot be matched"
+        ):
+            bouncer.psql_test(
+                dbname="p0y",
+                host=f"{bouncer.admin_host}",
+                user="bouncer",
+            )
+
+    with open(ident_conf_file, "w") as f:
+        f.write(f"mymap {cur_user} all")
+
+    bouncer.admin("reload")
+
+    bouncer.psql_test(
+        dbname="p0",
+        host=f"{bouncer.admin_host}",
+        user="bouncer",
+    )
+
+
+async def test_auth_user_trust_auth_without_auth_file_set(bouncer) -> None:
+    """
+    This is a regression test for issue #1116, using the SET command
+    """
+    bouncer.admin("set auth_user='pswcheck_not_in_auth_file'")
+    bouncer.admin("set auth_type='trust'")
+    with bouncer.conn(
+        dbname="p7a",
+        user="pswcheck_not_in_auth_file",
+    ) as cn:
+        with cn.cursor() as cur:
+            cur.execute("select 1")
+
+
+def test_auth_user_trust_auth_without_auth_file_reload(bouncer) -> None:
+    """
+    This is a regression test for issue #1116, using the RELOAD command
+    """
+    config = f"""
+        [databases]
+        postgres = host={bouncer.pg.host} dbname=postgres port={bouncer.pg.port} min_pool_size=2
+
+        [pgbouncer]
+        listen_addr = {bouncer.host}
+        listen_port = {bouncer.port}
+        auth_type = trust
+        auth_user = pswcheck_not_in_auth_file
+        auth_dbname = postgres
+        admin_users = pgbouncer
+        logfile = {bouncer.log_path}
+        auth_file = {bouncer.auth_path}
+    """
+
+    with bouncer.run_with_config(config):
+        with bouncer.conn(
+            dbname="postgres",
+            user="postgres",
+        ) as cn:
+            with cn.cursor() as cur:
+                cur.execute("select 1")
+
+
+def test_auth_user_at_db_level_trust_auth_without_auth_file_reload(bouncer) -> None:
+    """
+    This is a regression test for issue #1116, when auth_user was set at the
+    database level
+    """
+    config = f"""
+        [databases]
+        postgres = host={bouncer.pg.host} dbname=postgres port={bouncer.pg.port} min_pool_size=2 auth_user=pswcheck_not_in_auth_file
+
+        [pgbouncer]
+        listen_addr = {bouncer.host}
+        listen_port = {bouncer.port}
+        auth_type = trust
+        auth_dbname = postgres
+        admin_users = pgbouncer
+        logfile = {bouncer.log_path}
+        auth_file = {bouncer.auth_path}
+    """
+
+    with bouncer.run_with_config(config):
+        with bouncer.conn(
+            dbname="postgres",
+            user="pswcheck_not_in_auth_file",
+        ) as cn:
+            with cn.cursor() as cur:
+                cur.execute("select 1")
+
+
+def test_auth_user_with_same_forced_user(bouncer):
+    """
+    Check that the pgbouncer correctly handles multiple credentials with the
+    same name with a global auth_user (isue #1103).
+    """
+
+    config = f"""
+        [databases]
+        * = host={bouncer.pg.host} port={bouncer.pg.port} user=postgres min_pool_size=2
+        [pgbouncer]
+        listen_addr = {bouncer.host}
+        listen_port = {bouncer.port}
+        auth_type = trust
+        auth_user = postgres
+        auth_dbname = postgres
+        admin_users = pgbouncer
+        logfile = {bouncer.log_path}
+        auth_file = {bouncer.auth_path}
+    """
+
+    with bouncer.run_with_config(config):
+        # Let's get an error "no such user"
+        with pytest.raises(psycopg.OperationalError, match="no such user"):
+            bouncer.conn(dbname="dummydb2", user="dummyuser2", password="dummypswd2")
+        # Let's wait a few seconds for the janitor to kick in and crash pgbouncer
+        time.sleep(2)
+        # Now we will try to connect with OK parameters
+        with bouncer.conn(dbname="p3", user="postgres", password="asdasd") as cn:
+            with cn.cursor() as cur:
+                cur.execute("select 1")
+
+
+def test_auth_user_at_db_level_with_same_forced_user(bouncer):
+    """
+    Check that the pgbouncer correctly handles multiple credentials with the
+    same name with auth_user for the specific database (isue #1103).
+    """
+
+    config = f"""
+        [databases]
+        * = host={bouncer.pg.host} port={bouncer.pg.port} auth_user=postgres user=postgres min_pool_size=2
+        [pgbouncer]
+        listen_addr = {bouncer.host}
+        listen_port = {bouncer.port}
+        auth_type = trust
+        auth_dbname = postgres
+        admin_users = pgbouncer
+        logfile = {bouncer.log_path}
+        auth_file = {bouncer.auth_path}
+    """
+
+    with bouncer.run_with_config(config):
+        # Let's get an error "no such user"
+        with pytest.raises(psycopg.OperationalError, match="no such user"):
+            bouncer.conn(dbname="dummydb2", user="dummyuser2", password="dummypswd2")
+        # Let's wait a few seconds for the janitor to kick in and crash pgbouncer
+        time.sleep(2)
+        # Now we will try to connect with OK parameters
+        with bouncer.conn(dbname="p3", user="postgres", password="asdasd") as cn:
+            with cn.cursor() as cur:
+                cur.execute("select 1")

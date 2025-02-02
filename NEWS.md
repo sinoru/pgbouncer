@@ -1,6 +1,155 @@
 PgBouncer changelog
 ===================
 
+PgBouncer 1.24.x
+----------------
+
+**2025-01-10  -  PgBouncer 1.24.0  -  "New year, new bouncer"**
+
+- Features
+  * Add support for `Type=notify-reload` for systemd. This requires systemd
+    version 253 or later. ([#1148])
+  * Add `KILL_CLIENT` command to the admin console. This allows terminating a
+    client connection by force. ([#1147])
+  * Add `max_user_client_connections` setting, both globally and at the user level. ([#1137])
+  * Add `max_db_client_connections` setting, both globally and at the database level. ([#1138])
+  * Add `current_client_connections` counter to `SHOW USERS` and `SHOW DATABASES` output. ([#1137], [#1138])
+  * Add `load_balance_hosts` parameter, to support **not** load balancing between hosts. ([#736])
+  * Expose prepared statement usage counters in `SHOW STATS`. ([#1192])
+  * Add `client_idle_timeout` setting. ([#1189])
+  * Add user level `query_timeout` and `reserve_pool_size`. ([#1180], [#1228])
+  * Enable `pam` authentication support in HBA file. ([#326])
+
+- Changes
+  * Don't recycle connections on RELOAD if TLS config is unchanged. Previously
+    if you had TLS connections they would all be recycled on RELOAD, which could
+    cause a temporary but serious performance degradation. Now this only
+    happens when the TLS settings are actually changed. ([#1157])
+  * Enable prepared statement support by default, `max_prepared_statements` is
+    now set to 200 by default. This change in defaultls should only impact
+    clients that actually use prepared statements. If you do use prepared
+    statements it's recommended to read about the limitations of the prepared
+    statement support in [our documentation][prepared-docs] ([#1144])
+  * Sockets/clients/servers can now be identified by a unique ID in the admin
+    output. Previously they could be identified by their pointer, but these
+    would often be reused by new clients after disconnect. ([#1172])
+  * Clearer error for empty pidfile. ([#1195])
+  * Return original error to client in case of `server_login_retry` failure. ([#1152])
+  * Log original server error in case of error from `auth_query`. ([#1187])
+  * Setting `default_pool_size` to 0 means unlimited size. ([#1227])
+  * Change the name of the `reserve_pool` setting for databases, to
+    `reserve_pool_size`. The previous name is still an alias for the new name.
+    ([#1232])
+
+- Fixes
+  * Handle various unlikely error cases better, such as OOM errors. These could
+    previously cause crashes or memory leaks. ([#1108], [#1101], [#1099], [#1169], [#1202])
+  * Correct default value for `server_tls_sslmode` in sample config file. ([#1133])
+  * Remove mention in docs of invalid alias for `server_tls_protocols`. ([#1155])
+  * Fix bug when using `auth_query` and replication connections together. This
+    bug would cause connection failures in such setups. ([#1166])
+  * Ignore client cancel requests while PgBouncer is configuring server setting. ([#298])
+
+[prepared-docs]: https://www.pgbouncer.org/config.html#max_prepared_statements
+
+[#1148]: https://github.com/pgbouncer/pgbouncer/pull/1148
+[#1147]: https://github.com/pgbouncer/pgbouncer/pull/1147
+[#1137]: https://github.com/pgbouncer/pgbouncer/pull/1137
+[#1138]: https://github.com/pgbouncer/pgbouncer/pull/1138
+[#736]: https://github.com/pgbouncer/pgbouncer/pull/736
+[#1192]: https://github.com/pgbouncer/pgbouncer/pull/1192
+[#1189]: https://github.com/pgbouncer/pgbouncer/pull/1189
+[#1180]: https://github.com/pgbouncer/pgbouncer/pull/1180
+[#1228]: https://github.com/pgbouncer/pgbouncer/pull/1228
+[#326]: https://github.com/pgbouncer/pgbouncer/pull/326
+[#1157]: https://github.com/pgbouncer/pgbouncer/pull/1157
+[#1144]: https://github.com/pgbouncer/pgbouncer/pull/1144
+[#1172]: https://github.com/pgbouncer/pgbouncer/pull/1172
+[#1195]: https://github.com/pgbouncer/pgbouncer/pull/1195
+[#1152]: https://github.com/pgbouncer/pgbouncer/pull/1152
+[#1187]: https://github.com/pgbouncer/pgbouncer/pull/1187
+[#1227]: https://github.com/pgbouncer/pgbouncer/pull/1227
+[#1232]: https://github.com/pgbouncer/pgbouncer/pull/1232
+[#1108]: https://github.com/pgbouncer/pgbouncer/pull/1108
+[#1101]: https://github.com/pgbouncer/pgbouncer/pull/1101
+[#1099]: https://github.com/pgbouncer/pgbouncer/pull/1099
+[#1169]: https://github.com/pgbouncer/pgbouncer/pull/1169
+[#1202]: https://github.com/pgbouncer/pgbouncer/pull/1202
+[#1133]: https://github.com/pgbouncer/pgbouncer/pull/1133
+[#1155]: https://github.com/pgbouncer/pgbouncer/pull/1155
+[#1166]: https://github.com/pgbouncer/pgbouncer/pull/1166
+[#298]: https://github.com/pgbouncer/pgbouncer/pull/298
+
+
+PgBouncer 1.23.x
+----------------
+
+**2024-08-02  -  PgBouncer 1.23.1  -  "Everything is put back in order"**
+
+- Fixes
+  * Fix a possible segmentation fault after PgBouncer reloads its
+    configuration. ([#1105]) (bug introduced in 1.23.0)
+  * Fix all known put_in_order crashes. ([#1120])
+    (new crashes were introduced in 1.23.0)
+  * Add missing files to release tarball that are required for testing.
+    ([#1124]) (missing files were introduced in 1.23.0)
+
+[#1120]: https://github.com/pgbouncer/pgbouncer/pull/1120
+[#1105]: https://github.com/pgbouncer/pgbouncer/pull/1105
+[#1124]: https://github.com/pgbouncer/pgbouncer/pull/1124
+
+**2024-07-03  -  PgBouncer 1.23.0  -  "Into the new beginnings"**
+
+- Features
+  * Add support for rolling restarts. SIGTERM doesn't cause immediate shutdown
+    of the PgBouncer process anymore. It now does a "super safe shutdown":
+    waiting for all clients to disconnect before shutting down. The new SIGTERM
+    behaviour allows rolling restarts of multiple PgBouncer processes behind a
+    load balancer, or listening on the same port using `so_reuseport`.
+    This is a **minor breaking change**. If you relied on the old behaviour of
+    SIGTERM in your Dockerfile or Systemd service file you should now use SIGQUIT.
+    ([#902])
+  * Add support for user name maps for `cert` and `peer` authentication
+    methods. This feature provides the flexibility that the user initiating
+    the connection does not have to be the database user. PgBouncer support
+    for user name maps works very similar to the postgres with the exceptions
+    listed in the docs. ([#996])
+  * Add support for replication connections through PgBouncer. ([#876])
+
+- Changes
+  * Improve `SHOW USERS` output listing the connections. ([#1040])
+  * Allow `pool_size` configuration per user. ([#1049])
+  * Allow `server_lifetime` configuration per database. ([#1057])
+  * Add support for listing dynamically created users in the output of `SHOW USERS`. ([#1052])
+  * Add support for `all` address type in hba configuration. ([#1078])
+  * Add support for automatically restarting when using systemd. ([#1080])
+  * Increase c-ares minimum version requirement to 1.9.0 ([#1076])
+
+- Fixes
+  * Fix issues handling large and partial startup packets. ([#1058])
+  * Add support for `--config=value` format in options startup parameter. ([#1064])
+  * Fix `avg_wait_time` metric calculation. ([#727])
+  * Add support for negotiating the postgres protocol version with the client. ([#1007])
+  * Add outstanding request for `auth_query`. ([#1034])
+  * Multiple documentation and CI improvements.
+
+[#996]: https://github.com/pgbouncer/pgbouncer/pull/996
+[#1040]: https://github.com/pgbouncer/pgbouncer/pull/1040
+[#1049]: https://github.com/pgbouncer/pgbouncer/pull/1049
+[#1057]: https://github.com/pgbouncer/pgbouncer/pull/1057
+[#1052]: https://github.com/pgbouncer/pgbouncer/pull/1052
+[#1058]: https://github.com/pgbouncer/pgbouncer/pull/1058
+[#1007]: https://github.com/pgbouncer/pgbouncer/pull/1007
+[#876]: https://github.com/pgbouncer/pgbouncer/pull/876
+[#902]: https://github.com/pgbouncer/pgbouncer/pull/902
+[#1064]: https://github.com/pgbouncer/pgbouncer/pull/1064
+[#1078]: https://github.com/pgbouncer/pgbouncer/pull/1078
+[#1080]: https://github.com/pgbouncer/pgbouncer/pull/1080
+[#727]: https://github.com/pgbouncer/pgbouncer/pull/727
+[#1076]: https://github.com/pgbouncer/pgbouncer/pull/1076
+[#1034]: https://github.com/pgbouncer/pgbouncer/pull/1034
+
+
 PgBouncer 1.22.x
 ----------------
 
@@ -279,7 +428,7 @@ PgBouncer 1.18.x
     ([#648](https://github.com/pgbouncer/pgbouncer/pull/648))
   * Fix `SHOW HELP` with PostgreSQL 15
     ([#769](https://github.com/pgbouncer/pgbouncer/issues/769))
-  * Fix race condition in query cancelation handling.  It was possible
+  * Fix race condition in query cancellation handling.  It was possible
     that a query cancellation for one client canceled a query for
     another one.  This could happen when a cancel request was received
     by PgBouncer when the query it was meant to cancel already
@@ -825,7 +974,7 @@ PgBouncer 1.6.x
 
     [CVE-2015-6817](https://access.redhat.com/security/cve/cve-2015-6817)
 
-  * Skip NoticeResponce in handle_auth_response.  Otherwise verbose
+  * Skip NoticeResponse in handle_auth_response.  Otherwise verbose
     log levels on server cause login failures.
 
   * console: Fill `auth_user` when auth_type=any.  Otherwise
@@ -966,12 +1115,12 @@ PgBouncer 1.5.x
   * max_packet_size - config parameter to tune maximum packet size
     that is allowed through.  Default is kept same: (2G-1), but now
     it can be made smaller.
-  * In case of unparseable packet header, show it in hex in log and
+  * In case of unparsable packet header, show it in hex in log and
     error message.
 
 - Fixes
 
-  * AntiMake: it used $(relpath) and $(abspath) to manupulate pathnames,
+  * AntiMake: it used $(relpath) and $(abspath) to manipulate pathnames,
     but the result was build failure when source tree path contained
     symlinks.  The code is now changed to work on plain strings only.
   * console: now SET can be used to set empty string values.
@@ -1011,7 +1160,7 @@ PgBouncer 1.5.x
     earlier versions anymore.
   * Stop trying to retry on EINTR from close().
 
-**2012-01-05  -  PgBouncer 1.5  -  "Bouncing Satisified Clients Since 2007"**
+**2012-01-05  -  PgBouncer 1.5  -  "Bouncing Satisfied Clients Since 2007"**
 
 If you use more than 8 IPs behind one DNS name, you now need to
 use EDNS0 protocol to query.  Only getaddrinfo_a()/getaddrinfo()
@@ -1050,7 +1199,7 @@ GNU Make 3.81+ is required for building.
     (Dan McGee)
   * Console: Support ident quoting with "".  Originally we did not
     have any commands that took database names, so no quoting was needed.
-  * Console: allow numbers at the stard of word regex.  Trying
+  * Console: allow numbers at the start of word regex.  Trying
     to use strict parser makes things too complex here.
   * Don't expire auto DBs that are paused.
     (Michael Tharp)
@@ -1363,7 +1512,7 @@ PgBouncer 1.3.x
 
   * In case event_del() reports failure, just proceed with cleanup.
     Previously pgbouncer retried it, in case the failure was due ENOMEM.
-    But this has caused log floods with inifinite repeats, so it seems
+    But this has caused log floods with infinite repeats, so it seems
     libevent does not like it.
 
     Why event_del() report failure first time is still mystery.
@@ -1545,7 +1694,7 @@ PgBouncer 1.1.x
     - Accept custom unix socket location in host=
     - Accept quoted values: password=' asd''foo'
 
-  * New config var: server_reset_query, to be sent immidiately after release
+  * New config var: server_reset_query, to be sent immediately after release
   * New config var: server_round_robin, to switch between LIFO and RR.
   * Cancel pkt sent for idle connection does not drop it anymore.
   * Cancel with ^C from psql works for SUSPEND / PAUSE.
@@ -1634,13 +1783,13 @@ PgBouncer 1.0.x
 - Fixes
   * libevent may report a deleted event inside same loop.
     Avoid socket reuse for one loop.
-  * release_server() from disconnect_client() didnt look
+  * release_server() from disconnect_client() didn't look
     it the packet was actually sent.
 
 **2007-03-15  -  PgBouncer 1.0.1  -  "Alien technology"**
 
 - Fixes
-  * Mixed usage of cached and non-cached time, plus unsiged usec_t typedef
+  * Mixed usage of cached and non-cached time, plus unsigned usec_t typedef
     created spurious query_timeout errors.
   * Fix rare case when socket woken up from send-wait could stay stalling.
   * More fair queueing of server connections.  Before, a new query could

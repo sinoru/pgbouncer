@@ -176,6 +176,22 @@ pool.
 
 Default: 0 (unlimited)
 
+### max_db_client_connections
+
+Do not allow more than this many client connections to PgBouncer per database
+(regardless of user).  This considers the PgBouncer database that the
+client has connected to, not the PostgreSQL database of the outgoing
+connection.
+
+This should be set at a number greater than or equal to
+max_db_connections. The difference between the two numbers can be thought
+of as how many connections to a given database can be in the queue while
+waiting for active connections to finish.
+
+This can also be set per database in the `[databases]` section.
+
+Default: 0 (unlimited)
+
 ### max_user_connections
 
 Do not allow more than this many server connections per user
@@ -192,6 +208,15 @@ for another pool, because the server connection for the first pool is
 still open.  Once the server connection closes (due to idle timeout),
 a new server connection will immediately be opened for the waiting
 pool.
+
+Default: 0 (unlimited)
+
+### max_user_client_connections
+
+Do not allow more than this many client connections per user
+(regardless of database). This value should be set to a number higher than max_user_connections. This difference between max_user_connections and max_user_client_connections can be conceptualized as the number the max size of the queue for the user.
+
+This can also be set per user in the `[users]` section.
 
 Default: 0 (unlimited)
 
@@ -214,7 +239,7 @@ specified here, so that PgBouncer knows that they should be maintained in the cl
 and restored in the server whenever the client becomes active.
 
 If you need to specify multiple values, use a comma-separated list (e.g.
-`default_transaction_readonly, IntervalStyle`)
+`default_transaction_read_only, IntervalStyle`)
 
 Note: Most parameters cannot be tracked this way. The only parameters that can be tracked are ones that
 Postgres reports to the client. Postgres has
@@ -314,8 +339,8 @@ statement pooling mode. PgBouncer makes sure that any statement prepared by
 a client is available on the backing server connection. Even when the statement
 was originally prepared on another server connection.
 
-PgBouncer internally examines all the queries that are sent as a prepared
-statement by clients and gives each unique query string an internal name with
+PgBouncer internally examines all the queries that are sent by clients as a prepared
+statement, and gives each unique query string an internal name with
 the format `PGBOUNCER_{unique_id}`. If the same query string is prepared
 multiple times (possibly by different clients), then these queries share the
 same internal name. PgBouncer only prepares the statement on the actual
@@ -323,11 +348,11 @@ PostgreSQL server using the internal name (so not the name provided by the
 client). PgBouncer keeps track of the name that the client gave to each
 prepared statement. It then rewrites each command that uses a prepared
 statement to by replacing the client side name with the the internal name (e.g.
-replacing `my_prepared_stamenent` with `PGBOUNCER_123`) before forwarding that
+replacing `my_prepared_statement` with `PGBOUNCER_123`) before forwarding that
 command to the server. More importantly, if the prepared statement that the
 client wants to execute is not yet prepared on the server (e.g. because a
-different server is now assigned to the client then when the client prepared
-the statement), then PgBouncer transparrently prepares the statement before
+different server is now assigned to the client than when the client prepared
+the statement), then PgBouncer transparently prepares the statement before
 executing it.
 
 Note: This tracking and rewriting of prepared statement commands does not work
@@ -351,7 +376,7 @@ keep track of query strings.
 The impact on PgBouncer memory usage is not that big though:
 - Each unique query is stored once in a global query cache.
 - Each client connection keeps a buffer that it uses to rewrite packets. This
-  is at most 4 times the size of `pkt_buf`. This limit is often not reached
+  is, at most, 4 times the size of `pkt_buf`. This limit is often not reached
   though, it only happens when the queries in your prepared statements are
   between 2 and 4 times the size of `pkt_buf`.
 
@@ -361,7 +386,7 @@ So if you consider the following as an example scenario:
 - The average size of a query is 5kB
 - `pkt_buf` parameter is set to the default of 4096 (4kB)
 
-Then PgBouncer needs at most the following amount of memory to handle these
+Then, PgBouncer needs at most the following amount of memory to handle these
 prepared statements:
 
 200 x 5kB + 1000 x 4 x 4kB = ~17MB of memory.
@@ -378,7 +403,7 @@ executed many times, it reduces the total amount of parsing and planning that
 needs to be done. The way that PgBouncer tracks prepared statements is
 especially beneficial to performance when multiple clients prepare the same
 queries. Because client connections automatically reuse a prepared statement on
-a server connection even if it was prepared by another client. As an example if
+a server connection, even if it was prepared by another client. As an example, if
 you have a `pool_size` of 20 and you have 100 clients that all prepare the
 exact same query, then the query is prepared (and thus parsed) only 20 times on
 the PostgreSQL server.
@@ -397,9 +422,9 @@ result types. One of the most common ways of running into this issue is during
 a DDL migration where you add a new column or change a column type on an
 existing table. In those cases you can run `RECONNECT` on the PgBouncer admin
 console after doing the migration to force a re-prepare of the query and make
-the error goes away.
+the error go away.
 
-Default: 0
+Default: 200
 
 
 ## Authentication settings
@@ -445,11 +470,19 @@ hba
 pam
 :   PAM is used to authenticate users, `auth_file` is ignored. This method is not
     compatible with databases using the `auth_user` option. The service name reported to
-    PAM is "pgbouncer". `pam` is not supported in the HBA configuration file.
+    PAM is "pgbouncer".
 
 ### auth_hba_file
 
-HBA configuration file to use when `auth_type` is `hba`.
+HBA configuration file to use when `auth_type` is `hba`. See
+section [HBA file format](#hba-file-format) below about details.
+
+Default: not set
+
+### auth_ident_file
+
+Identity map file to use when `auth_type` is `hba` and a user map will be defined.  See
+section [Ident map file format](#ident-map-file-format) below about details.
 
 Default: not set
 
@@ -546,6 +579,7 @@ Default: 1
 
 Increase verbosity.  Mirrors the "-v" switch on the command line.
 For example, using "-v -v" on the command line is the same as `verbose=2`.
+3 is the highest currently-supported verbosity.
 
 Default: 0
 
@@ -648,6 +682,8 @@ server connection that has been connected longer
 than this. Setting it to 0 means the connection is to be used only once,
 then closed. [seconds]
 
+This can also be set per database in the `[databases]` section.
+
 Default: 3600.0
 
 ### server_idle_timeout
@@ -743,12 +779,23 @@ Default: empty (use operating system defaults)
 
 ## TLS settings
 
+If the contents of any of the cert or key files are changed without
+changing the actual setting filename in the config, the new file
+contents will be used for new connections after a RELOAD. Existing
+connections won't be closed though. If it's necessary for security
+reasons that all connections start using the new files ASAP, it's
+advised to run RECONNECT after the RELOAD.
+
+Changing any TLS settings will trigger a RECONNECT automatically
+for security reasons.
+
 ### client_tls_sslmode
 
 TLS mode to use for connections from clients.  TLS connections
 are disabled by default.  When enabled, `client_tls_key_file`
 and `client_tls_cert_file` must be also configured to set up
 the key and certificate PgBouncer uses to accept client connections.
+The most common certificate file format usable by PgBouncer is pem.
 
 disable
 :   Plain TCP.  If client requests TLS, it's ignored.  Default.
@@ -791,7 +838,7 @@ Default: not set
 ### client_tls_protocols
 
 Which TLS protocol versions are allowed.  Allowed values: `tlsv1.0`, `tlsv1.1`, `tlsv1.2`, `tlsv1.3`.
-Shortcuts: `all` (tlsv1.0,tlsv1.1,tlsv1.2,tlsv1.3), `secure` (tlsv1.2,tlsv1.3), `legacy` (all).
+Shortcuts: `all` (tlsv1.0,tlsv1.1,tlsv1.2,tlsv1.3), `secure` (tlsv1.2,tlsv1.3).
 
 Default: `secure`
 
@@ -1166,8 +1213,9 @@ user name, meaning that there will be one pool per user.
 
 ### password
 
-If no password is specified here, the password from the `auth_file` or
-`auth_query` will be used.
+If no password is specified here, the password from the `auth_file` will
+be used for the user specified above. Dynamic forms of password discovery
+such as `auth_query` are not currently supported.
 
 ### auth_user
 
@@ -1198,10 +1246,10 @@ Only enforced if at least one of the following is true:
 * there is at least one client connected to the pool
 
 
-### reserve_pool
+### reserve_pool_size
 
-Set additional connections for this database. If not set, `reserve_pool_size` is
-used.
+Set additional connections for this database. If not set, the global `reserve_pool_size`
+is used. For backwards compatibilty reasons `reserve_pool` is an alias for this option.
 
 ### connect_query
 
@@ -1214,10 +1262,43 @@ they are logged but ignored otherwise.
 Set the pool mode specific to this database. If not set,
 the default `pool_mode` is used.
 
+### load_balance_hosts
+
+When a comma-separated list is specified in `host`, `load_balance_hosts` controls
+which entry is chosen for a new connection.
+
+Note: This setting currently only controls the load balancing behaviour when
+providing multiple hosts in the connection string, but not when a single host
+its DNS record references multiple IP addresses. This is a missing feature, so
+in a future release this setting might start to to control both methods of load
+balancing.
+
+round-robin
+:   A new connection attempt chooses the next host entry in the list.
+
+disable
+:   A new connection continues using the same host entry until a connection
+    fails, after which the next host entry is chosen.
+
+It is recommended to set `server_login_retry` lower than the default to ensure
+fast retries when multiple hosts are available.
+
+Default: `round-robin`
+
 ### max_db_connections
 
-Configure a database-wide maximum (i.e. all pools within the database will
+Configure a database-wide maximum of server connections (i.e. all pools within the database will
 not have more than this many server connections).
+
+### max_db_client_connections
+
+Configure a database-wide client connection maximum. Should be used in conjunction with max_client_conn
+to limit the number of connections that PgBouncer is allowed to accept.
+
+### server_lifetime
+
+Configure the server_lifetime per database. If not set the database will fall back
+to the instance wide configured value for `server_lifetime`
 
 ### client_encoding
 
@@ -1246,6 +1327,22 @@ Example:
 
 Only a few settings are available here.
 
+Note that when `auth_file` is configured, if a user is defined in this section
+but not listed in `auth_file`, pgBouncer will attempt to use `auth_query` to
+find a password for that user if `auth_user` is set. If `auth_user` is not set,
+pgBouncer will pretend the user exists and fail to return "no such user"
+messages to the client, but neither will it accept any provided password.
+
+### pool_size
+
+Set the maximum size of pools for all connections from this user.  If not set,
+the database or `default_pool_size` is used.
+
+### reserve_pool_size
+
+Set the number of additional connections to allow to a pool for this user. If
+not set, the database configuration or the global `reserve_pool_size` is used.
+
 ### pool_mode
 
 Set the pool mode to be used for all connections from this user. If not set, the
@@ -1253,8 +1350,31 @@ database or default `pool_mode` is used.
 
 ### max_user_connections
 
-Configure a maximum for the user (i.e. all pools with the user will
+Configure a maximum for the user of server connections (i.e. all pools with the user will
 not have more than this many server connections).
+
+### query_timeout
+
+Set the maximum number of seconds that a user query can run for.
+If set this timeout overrides the server level query_timeout described above.
+
+### idle_transaction_timeout
+
+Set the maximum number of seconds that a user can have an idle transaction open.
+If set this timeout overides the server level idle_transaction_timeout
+described above.
+
+### client_idle_timeout
+
+Set the maximum amount of time in seconds that a client is allowed to idly connect to
+the pgbouncer instance. If set this timeout overrides the server level client_idle_timeout
+described above.
+
+Please note that this is a potentially dangeous timeout.
+
+### max_user_client_connections
+Configure a maximum for the user of client connections. This is the user equivalent ofthe max_client_conn setting.
+
 
 ## Section [peers]
 
@@ -1381,8 +1501,17 @@ client connections, if a password-based authentication method is
 configured.  Second, they are used as the passwords for outgoing
 connections to the backend server, if the backend server requires
 password-based authentication (unless the password is specified
-directly in the database's connection string).  The latter works if
-the password is stored in plain text or MD5-hashed.  SCRAM secrets can
+directly in the database's connection string).
+
+### Limitations
+If the password is stored in plain text, it can be used for any password-based
+authentication used in the backend server; plain text, MD5 or SCRAM
+(see <https://www.postgresql.org/docs/current/auth-password.html> for details).
+
+MD5-hashed passwords can be used if backend server uses MD5 authentication
+(or specific users have MD5-hashed passwords).
+
+SCRAM secrets can
 only be used for logging into a server if the client authentication
 also uses SCRAM, the PgBouncer database definition does not specify a
 user name, and the SCRAM secrets are identical in PgBouncer and the
@@ -1398,6 +1527,37 @@ file from the `pg_shadow` system table.  Alternatively, use
 `auth_query` instead of `auth_file` to avoid having to maintain a
 separate authentication file.
 
+### Note on managed servers
+If the backend server is configured to use SCRAM password authentication PgBouncer cannot
+successfully authenticate if it does not know either a) user password in plain text or
+b) corresponding SCRAM secret.
+
+Some cloud providers (i.e. AWS RDS) prohibit access to PostgreSQL sensitive system tables
+for fetching passwords. Even for the most privileged user (i.e. member of rds_superuser) the
+`select * from pg_authid`;  returns the `ERROR:  permission denied for table pg_authid.`
+That is a known behaviour
+([blog](https://aws.amazon.com/blogs/database/best-practices-for-migrating-postgresql-databases-to-amazon-rds-and-amazon-aurora/)).
+
+Therefore, fetching an existing SCRAM secret once it has been stored in a managed server
+is impossible which makes it hard to configure PgBouncer to use the same SCRAM secret.
+Nevertheless, SCRAM secret can still be configured and used on both sides using the following trick:
+
+Generate SCRAM secret for arbitrary password with a tool that is capable of printing out the secret.
+For example `psql --echo-hidden` and the command `\password` prints out the SCRAM secret
+to the console before sending it over to the server.
+```
+$ psql --echo-hidden <connection_string>
+postgres=# \password <role_name>
+Enter new password for user "<role_name>":
+Enter it again:
+********* QUERY **********
+ALTER USER <role_name> PASSWORD 'SCRAM-SHA-256$<iterations>:<salt>$<storedkey>:<serverkey>'
+**************************
+```
+Note down the SCRAM secret from the QUERY and set it in PgBouncer's `userlist.txt`.
+
+If you used a tool other than `psql --echo-hidden` then you need to set the SCRAM secret also in the server
+(you can use `alter role <role_name> password '<scram_secret>'` for that).
 
 ## HBA file format
 
@@ -1408,13 +1568,25 @@ The file follows the format of the PostgreSQL `pg_hba.conf` file
 (see <https://www.postgresql.org/docs/current/auth-pg-hba-conf.html>).
 
 * Supported record types: `local`, `host`, `hostssl`, `hostnossl`.
-* Database field: Supports `all`, `sameuser`, `@file`, multiple names.  Not supported: `replication`, `samerole`, `samegroup`.
+* Database field: Supports `all`, `replication`, `sameuser`, `@file`, multiple names.  Not supported: `samerole`, `samegroup`.
 * User name field: Supports `all`, `@file`, multiple names.  Not supported: `+groupname`.
-* Address field: Supports IPv4, IPv6.  Not supported: DNS names, domain prefixes.
+* Address field: Supports `all`, IPv4, IPv6.  Not supported: `samehost`, `samenet`, DNS names, domain prefixes.
 * Auth-method field: Only methods supported by PgBouncer's `auth_type`
-  are supported, plus `peer` and `reject`, but except `any` and `pam`, which only work globally.
-  User name map (`map=`) parameter is not supported.
+  are supported, plus `peer` and `reject`, but except `any`, which only works globally.
+* User name map (`map=`) parameter is supported when `auth_type` is `cert` or `peer`.
 
+## Ident map file format
+
+The location of the ident map file is specified by the setting
+`auth_ident_file`. It is only loaded if `auth_type` is set to `hba`.
+
+The file format is a simplified variation of the PostgreSQL ident map file
+(see <https://www.postgresql.org/docs/current/auth-username-maps.html>).
+
+* Supported lines are only of the form `map-name system-username database-username`.
+* There is no support for including file/directory.
+* System-username field: Not supported: regular expressions.
+* Database-username field: Supports `all` or a single postgres user name. Not supported: `+groupname`, regular expressions.
 
 ## Examples
 

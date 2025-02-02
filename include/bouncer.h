@@ -90,9 +90,26 @@ enum PauseMode {
 };
 
 enum ShutDownMode {
+	/* just stay running */
 	SHUTDOWN_NONE = 0,
-	/* wait for all servers to become idle before stopping the process */
+	/*
+	 * Wait for all servers to become idle before stopping the process. New
+	 * client connection attempts are denied while waiting for the servers
+	 * to be released. Already connected clients that go to CL_WAITING
+	 * state are disconnected eagerly.
+	 */
 	SHUTDOWN_WAIT_FOR_SERVERS,
+	/*
+	 * Wait for all clients to disconnect before stopping the process.
+	 * While waiting for this we stop listening on the socket so no new
+	 * clients can connect. Still connected clients will continue to be
+	 * handed connections from the pool until they disconnect.
+	 *
+	 * This allows for a rolling restart in combination with so_reuseport.
+	 *
+	 * This is an even more graceful shutdown than SHUTDOWN_WAIT_FOR_SERVERS.
+	 */
+	SHUTDOWN_WAIT_FOR_CLIENTS,
 	/* close all connections immediately and stop the process */
 	SHUTDOWN_IMMEDIATE,
 };
@@ -122,12 +139,17 @@ enum PacketCallbackFlag {
 	CB_HANDLE_COMPLETE_PACKET,
 };
 
+enum LoadBalanceHosts {
+	LOAD_BALANCE_HOSTS_DISABLE,
+	LOAD_BALANCE_HOSTS_ROUND_ROBIN
+};
 
 #define is_server_socket(sk) ((sk)->state >= SV_FREE)
 
 
 typedef struct PgSocket PgSocket;
-typedef struct PgUser PgUser;
+typedef struct PgCredentials PgCredentials;
+typedef struct PgGlobalUser PgGlobalUser;
 typedef struct PgDatabase PgDatabase;
 typedef struct PgPool PgPool;
 typedef struct PgStats PgStats;
@@ -139,6 +161,7 @@ typedef struct PktBuf PktBuf;
 typedef struct ScramState ScramState;
 typedef struct PgPreparedStatement PgPreparedStatement;
 typedef enum ResponseAction ResponseAction;
+typedef enum ReplicationType ReplicationType;
 
 extern int cf_sbuf_len;
 
@@ -193,41 +216,26 @@ extern int cf_sbuf_len;
 #define MAX_PASSWORD    2048
 
 /*
- * AUTH_* symbols are used for both protocol handling and
- * configuration settings (auth_type, hba).  Some are only applicable
- * to one or the other.
+ * Symbols for authentication type settings (auth_type, hba).
  */
-
-/* no-auth modes */
-#define AUTH_ANY        -1	/* same as trust but without username check */
-#define AUTH_TRUST      AUTH_OK
-
-/* protocol codes in Authentication* 'R' messages from server */
-#define AUTH_OK         0
-#define AUTH_KRB4       1	/* not supported */
-#define AUTH_KRB5       2	/* not supported */
-#define AUTH_PLAIN      3
-#define AUTH_CRYPT      4	/* not supported */
-#define AUTH_MD5        5
-#define AUTH_SCM_CREDS  6	/* not supported */
-#define AUTH_GSS        7	/* not supported */
-#define AUTH_GSS_CONT   8	/* not supported */
-#define AUTH_SSPI       9	/* not supported */
-#define AUTH_SASL       10
-#define AUTH_SASL_CONT  11
-#define AUTH_SASL_FIN   12
-
-/* internal codes */
-#define AUTH_CERT       107
-#define AUTH_PEER       108
-#define AUTH_HBA        109
-#define AUTH_REJECT     110
-#define AUTH_PAM        111
-#define AUTH_SCRAM_SHA_256      112
+enum auth_type {
+	AUTH_TYPE_ANY,
+	AUTH_TYPE_TRUST,
+	AUTH_TYPE_PLAIN,
+	AUTH_TYPE_MD5,
+	AUTH_TYPE_CERT,
+	AUTH_TYPE_HBA,
+	AUTH_TYPE_PAM,
+	AUTH_TYPE_SCRAM_SHA_256,
+	AUTH_TYPE_PEER,
+	AUTH_TYPE_REJECT,
+};
 
 /* type codes for weird pkts */
 #define PKT_STARTUP_V2  0x20000
-#define PKT_STARTUP     0x30000
+#define PKT_STARTUP_V3  0x30000
+#define PKT_STARTUP_V3_UNSUPPORTED 0x30001
+#define PKT_STARTUP_V4  0x40000
 #define PKT_CANCEL      80877102
 #define PKT_SSLREQ      80877103
 #define PKT_GSSENCREQ   80877104
@@ -298,6 +306,7 @@ int pga_cmp_addr(const PgAddr *a, const PgAddr *b);
  * Stats, kept per-pool.
  */
 struct PgStats {
+	uint64_t server_assignment_count;
 	uint64_t xact_count;
 	uint64_t query_count;
 	uint64_t server_bytes;
@@ -326,7 +335,11 @@ struct PgPool {
 	struct List map_head;			/* entry in user->pool_list */
 
 	PgDatabase *db;			/* corresponding database */
-	PgUser *user;			/* user logged in as, this field is NULL for peer pools */
+	/*
+	 * credentials for the user logged in user, this field is NULL for peer
+	 * pools.
+	 */
+	PgCredentials *user_credentials;
 
 	/*
 	 * Clients that are both logged in and where pgbouncer is actively
@@ -347,6 +360,11 @@ struct PgPool {
 	 * Clients that sent cancel request, to cancel another client its query.
 	 * These requests are waiting for a new server connection to be opened,
 	 * before the request can be forwarded.
+	 *
+	 * This is a separate list from waiting_client_list, because we want to
+	 * give cancel requests priority over regular clients. The main reason
+	 * for this is, because a cancel request might free up a connection,
+	 * which can be used for one of the waiting clients.
 	 */
 	struct StatList waiting_cancel_req_list;
 
@@ -409,7 +427,7 @@ struct PgPool {
 	 *
 	 * A special case is when there are cancel requests waiting to be forwarded
 	 * to servers in waiting_cancel_req_list. In that case the server bails out
-	 * of the login flow, because a cancel reuest needs to be sent before
+	 * of the login flow, because a cancel request needs to be sent before
 	 * logging in.
 	 *
 	 * NOTE: This list can at most contain a single server due to the way
@@ -431,6 +449,7 @@ struct PgPool {
 	/* if last connect to server failed, there should be delay before next */
 	usec_t last_connect_time;
 	bool last_connect_failed : 1;
+	char last_connect_failed_message[100];
 	bool last_login_failed : 1;
 
 	bool welcome_msg_ready : 1;
@@ -473,19 +492,9 @@ struct PgPool {
 		statlist_count(&(pool)->waiting_client_list))
 
 /*
- * A user in login db.
- *
- * FIXME: remove ->head as ->tree_node should be enough.
- *
- * For databases where remote user is forced, the pool is:
- * first(db->forced_user->pool_list), where pool_list has only one entry.
- *
- * Otherwise, ->pool_list contains multiple pools, for all PgDatabases
- * which user has logged in.
+ * Credentials for a user in login db.
  */
-struct PgUser {
-	struct List head;		/* used to attach user to list */
-	struct List pool_list;		/* list of pools where pool->user == this user */
+struct PgCredentials {
 	struct AANode tree_node;	/* used to attach user to tree */
 	char name[MAX_USERNAME];
 	char passwd[MAX_PASSWORD];
@@ -493,9 +502,40 @@ struct PgUser {
 	uint8_t scram_ServerKey[32];
 	bool has_scram_keys;		/* true if the above two are valid */
 	bool mock_auth;			/* not a real user, only for mock auth */
+	bool dynamic_passwd;		/* does the password need to be refreshed every use */
+
+	/*
+	 * global_user points at the global user which is used for configuration
+	 * settings and connection count tracking.
+	 */
+	PgGlobalUser *global_user;
+};
+
+/*
+ * The global user is used for configuration settings and connection count. It
+ * includes credentials, but these are empty if the user is not configured in
+ * the auth_file.
+ *
+ * global_user->pool_list contains all the pools that this user is used for
+ * each PgDatabases that uses this global user.
+ *
+ * FIXME: remove ->head as ->tree_node should be enough.
+ */
+struct PgGlobalUser {
+	PgCredentials credentials;	/* needs to be first for AAtree */
+	struct List head;	/* used to attach user to list */
+	struct List pool_list;	/* list of pools where pool->user == this user */
 	int pool_mode;
-	int max_user_connections;	/* how much server connections are allowed */
-	int connection_count;	/* how much connections are used by user now */
+	int pool_size;	/* max server connections in one pool */
+	int res_pool_size;	/* max additional server connections in one pool */
+
+	usec_t idle_transaction_timeout;	/* how long a user is allowed to stay idle in transaction before being killed */
+	usec_t query_timeout;	/* how long a users query is allowed to run before beign killed */
+	usec_t client_idle_timeout;	/* how long is user allowed to idly connect to pgbouncer */
+	int max_user_connections;	/* how many server connections are allowed */
+	int max_user_client_connections;	/* how many client connections are allowed */
+	int connection_count;	/* how many server connections are used by user now */
+	int client_connection_count;	/* how many client connections are used by user now */
 };
 
 /*
@@ -520,14 +560,17 @@ struct PgDatabase {
 	int min_pool_size;	/* min server connections in one pool */
 	int res_pool_size;	/* additional server connections in case of trouble */
 	int pool_mode;		/* pool mode for this database */
+	int max_db_client_connections;	/* max connections that pgbouncer will accept from client to this database */
 	int max_db_connections;	/* max server connections between all pools */
+	usec_t server_lifetime;	/* max lifetime of server connection */
 	char *connect_query;	/* startup commands to send to server after connect */
+	enum LoadBalanceHosts load_balance_hosts;	/* strategy for host selection in a comma-separated host list */
 
 	struct PktBuf *startup_params;	/* partial StartupMessage (without user) be sent to server */
 	const char *dbname;	/* server-side name, pointer to inside startup_msg */
 	char *auth_dbname;	/* if not NULL, auth_query will be run on the specified database */
-	PgUser *forced_user;	/* if not NULL, the user/psw is forced */
-	PgUser *auth_user;	/* if not NULL, users not in userlist.txt will be looked up on the server */
+	PgCredentials *forced_user_credentials;	/* if not NULL, the user/psw is forced */
+	PgCredentials *auth_user_credentials;	/* if not NULL, users not in userlist.txt will be looked up on the server */
 	char *auth_query;	/* if not NULL, will be used to fetch password from database. */
 
 	/*
@@ -543,6 +586,7 @@ struct PgDatabase {
 	usec_t inactive_time;	/* when auto-database became inactive (to kill it after timeout) */
 	unsigned active_stamp;	/* set if autodb has connections */
 	int connection_count;	/* total connections for this database in all pools */
+	int client_connection_count;	/* total client connections for this database */
 
 	struct AATree user_tree;	/* users that have been queried on this database */
 };
@@ -577,6 +621,14 @@ typedef struct OutstandingRequest {
 	uint64_t server_ps_query_id;
 } OutstandingRequest;
 
+enum ReplicationType {
+	REPLICATION_NONE = 0,
+	REPLICATION_LOGICAL,
+	REPLICATION_PHYSICAL,
+};
+
+extern const char *replication_type_parameters[3];
+
 /*
  * A client or server connection.
  *
@@ -588,14 +640,18 @@ struct PgSocket {
 	PgSocket *link;		/* the dest of packets */
 	PgPool *pool;		/* parent pool, if NULL not yet assigned */
 
-	PgUser *login_user;	/* presented login, for client it may differ from pool->user */
+	PgCredentials *login_user_credentials;	/* presented login, for client it may differ from pool->user */
 
+	unsigned long long int id;	/* unique numeric ID used to identify PgSocket instance */
 	int client_auth_type;	/* auth method decided by hba */
 
 	/* the queue of requests that we still expect a server response for */
 	struct StatList outstanding_requests;
 
 	SocketState state : 8;		/* this also specifies socket location */
+
+	bool contributes_db_client_count : 1;
+	bool user_connection_counted : 1;
 
 	bool ready : 1;			/* server: accepts new query */
 	bool idle_tx : 1;		/* server: idling in tx */
@@ -620,6 +676,9 @@ struct PgSocket {
 	/* server: received an ErrorResponse, waiting for ReadyForQuery to clear
 	 * the outstanding requests until the next Sync */
 	bool query_failed : 1;
+
+	ReplicationType replication;	/* If this is a replication connection */
+	char *startup_options;	/* only tracked for replication connections */
 
 	usec_t connect_time;	/* when connection was made */
 	usec_t request_time;	/* last activity time */
@@ -712,7 +771,9 @@ extern int cf_min_pool_size;
 extern int cf_res_pool_size;
 extern usec_t cf_res_pool_timeout;
 extern int cf_max_db_connections;
+extern int cf_max_db_client_connections;
 extern int cf_max_user_connections;
+extern int cf_max_user_client_connections;
 
 extern char *cf_autodb_connstr;
 extern usec_t cf_autodb_idle_timeout;
@@ -733,6 +794,8 @@ extern usec_t cf_cancel_wait_timeout;
 extern usec_t cf_client_idle_timeout;
 extern usec_t cf_client_login_timeout;
 extern usec_t cf_idle_transaction_timeout;
+extern bool any_user_level_timeout_set;
+extern bool any_user_level_client_timeout_set;
 extern int cf_server_round_robin;
 extern int cf_disable_pqexec;
 extern usec_t cf_dns_max_ttl;
@@ -796,6 +859,7 @@ extern char *cf_server_tls_ciphers;
 extern int cf_max_prepared_statements;
 
 extern const struct CfLookup pool_mode_map[];
+extern const struct CfLookup load_balance_hosts_map[];
 
 extern usec_t g_suspend_start;
 
