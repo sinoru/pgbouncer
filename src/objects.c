@@ -125,6 +125,7 @@ static void construct_server(void *obj)
 	server->vars.var_list = slab_alloc(var_list_cache);
 	server->state = SV_FREE;
 	server->server_prepared_statements = NULL;
+	server->host = NULL;
 	statlist_init(&server->outstanding_requests, "outstanding_requests");
 
 	server->id = ++last_pgsocket_id;
@@ -210,6 +211,7 @@ static void server_free(PgSocket *server)
 	}
 
 	free_server_prepared_statements(server);
+	free(server->host);
 	varcache_clean(&server->vars);
 	slab_free(var_list_cache, server->vars.var_list);
 	slab_free(server_cache, server);
@@ -238,6 +240,7 @@ void change_client_state(PgSocket *client, SocketState newstate)
 			newstate = CL_LOGIN;
 	/* fallthrough */
 	case CL_WAITING:
+		client->sent_wait_notification = false;
 		statlist_remove(&pool->waiting_client_list, &client->head);
 		break;
 	case CL_ACTIVE:
@@ -1384,7 +1387,7 @@ void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...
 			unlink_server(server, reason);
 		break;
 	default:
-		fatal("bad server state: %d", server->state);
+		fatal("bad server state: %d, %s", server->state, reason);
 	}
 
 	Assert(server->link == NULL);
@@ -1524,6 +1527,8 @@ void disconnect_client_sqlstate(PgSocket *client, bool notify, const char *sqlst
 			PgSocket *server = client->link;
 			server->link = NULL;
 			client->link = NULL;
+			/* notify disconnect_server() that connect did not fail */
+			server->ready = true;
 			disconnect_server(server, false, "client gave up on cancel request, so we also give up forwarding to server");
 		}
 		/*
@@ -1564,7 +1569,7 @@ void disconnect_client_sqlstate(PgSocket *client, bool notify, const char *sqlst
 		}
 		break;
 	default:
-		fatal("bad client state: %d", client->state);
+		fatal("bad client state: %d, %s", client->state, reason ? reason : "NULL");
 	}
 
 	/* send reason to client */
@@ -1690,6 +1695,10 @@ static void dns_connect(struct PgSocket *server)
 			server->pool->rrcounter++;
 	} else {
 		host = db->host;
+	}
+
+	if (host) {
+		server->host = xstrdup(host);
 	}
 
 	if (!host || host[0] == '/' || host[0] == '@') {
@@ -2027,6 +2036,11 @@ bool finish_client_login(PgSocket *client)
 		return false;
 	}
 
+	if (cf_shutdown && strcmp("pgbouncer", client->db->name)) {
+		disconnect_client(client, true, "pooler is shutting down");
+		return false;
+	}
+
 	switch (client->state) {
 	case CL_LOGIN:
 		change_client_state(client, CL_ACTIVE);
@@ -2053,6 +2067,7 @@ bool finish_client_login(PgSocket *client)
 	if (!welcome_client(client))
 		return false;
 
+	client->welcome_sent = true;
 	slog_debug(client, "logged in");
 
 	return true;
@@ -2225,7 +2240,7 @@ found:
 	launch_new_connection(pool, /* evict_if_needed= */ true);
 }
 
-bool forward_cancel_request(PgSocket *server)
+void forward_cancel_request(PgSocket *server)
 {
 	bool res;
 	PgSocket *req = first_socket(&server->pool->waiting_cancel_req_list);
@@ -2233,6 +2248,9 @@ bool forward_cancel_request(PgSocket *server)
 
 	Assert(req != NULL && req->state == CL_WAITING_CANCEL);
 	Assert(server->state == SV_LOGIN);
+
+	server->link = req;
+	req->link = server;
 
 	if (!forwarding_to_peer) {
 		/*
@@ -2245,12 +2263,9 @@ bool forward_cancel_request(PgSocket *server)
 		 */
 		if (!req->canceled_server) {
 			disconnect_client(req, false, "not sending cancel request for client that is now idle");
-			return false;
+			return;
 		}
 	}
-
-	server->link = req;
-	req->link = server;
 
 	if (forwarding_to_peer) {
 		SEND_CancelRequest(res, server, req->cancel_key);
@@ -2260,11 +2275,14 @@ bool forward_cancel_request(PgSocket *server)
 	if (!res) {
 		slog_warning(req, "sending cancel request failed: %s", strerror(errno));
 		disconnect_client(req, false, "failed to send cancel request");
-		return false;
+		return;
 	}
 	slog_debug(req, "started sending cancel request");
+
 	change_client_state(req, CL_ACTIVE_CANCEL);
-	return true;
+	change_server_state(server, SV_ACTIVE_CANCEL);
+	sbuf_continue(&server->sbuf);
+	return;
 }
 
 bool use_client_socket(int fd, PgAddr *addr,
@@ -2316,7 +2334,7 @@ bool use_client_socket(int fd, PgAddr *addr,
 
 		memcpy(credentials->scram_ClientKey, scram_client_key, sizeof(credentials->scram_ClientKey));
 		memcpy(credentials->scram_ServerKey, scram_server_key, sizeof(credentials->scram_ServerKey));
-		credentials->has_scram_keys = true;
+		credentials->use_scram_keys = true;
 	}
 
 	client = accept_client(fd, pga_is_unix(addr));
@@ -2651,6 +2669,9 @@ void objects_cleanup(void)
 		PgSocket *client = container_of(item, PgSocket, head);
 		client_free(client);
 	}
+
+	/* Cleanup cached scram keys stored with PgCredentials */
+	clear_user_tree_cached_scram_keys(&user_tree);
 
 	memset(&login_client_list, 0, sizeof login_client_list);
 	memset(&user_list, 0, sizeof user_list);

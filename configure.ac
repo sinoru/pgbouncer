@@ -1,7 +1,7 @@
 dnl Process this file with autoconf to produce a configure script.
 
 AC_INIT([PgBouncer],
-        [1.24.1],
+        [1.25.0],
         [https://github.com/pgbouncer/pgbouncer/issues], [],
         [https://www.pgbouncer.org/])
 AC_CONFIG_SRCDIR(src/janitor.c)
@@ -35,11 +35,8 @@ dnl Checks for typedefs, structures, and compiler characteristics.
 AC_USUAL_TYPE_CHECK
 
 dnl autoconf 2.59 does not have UINT macros nor docdir
-m4_ifdef([AC_TYPE_UINT8_T], [
-  AC_TYPE_UINT8_T
-  AC_TYPE_UINT32_T
-  AC_TYPE_UINT64_T
-], [
+m4_ifdef([AC_TYPE_UINT8_T], [],
+[
   datarootdir='${prefix}/share'
   docdir='${datarootdir}/doc/${PACKAGE_TARNAME}'
   AC_SUBST(datarootdir)
@@ -75,6 +72,31 @@ AC_ARG_WITH(pam,
         if test x"${have_pam_header}" != x -a x"${have_libpam}" != x -a x"${have_pthreads}" = xyes; then
           pam_support=yes
           AC_DEFINE(HAVE_PAM, 1, [PAM support])
+        fi
+    fi
+  ], [])
+
+dnl Check for LDAP authentication support
+ldap_support=no
+AC_ARG_WITH(ldap,
+  AS_HELP_STRING([--with-ldap], [build with LDAP support]),
+  [ LDAP=
+    if test "$withval" != no; then
+        have_pthreads=no
+        # Look for LDAP header and lib
+        AC_CHECK_HEADERS(ldap.h, [have_ldap_header=t])
+        AC_CHECK_HEADERS(pthread.h, [have_pthreads=yes])
+        AC_SEARCH_LIBS(ldap_initialize, ldap, [have_libldap=t])
+        AC_SEARCH_LIBS(pthread_create, pthread, [], [have_pthreads=no])
+        if test x"${have_pthreads}" != xyes; then
+           AC_MSG_ERROR([pthread library should be available for LDAP support])
+        fi
+        if test x"${have_ldap_header}" != x -a x"${have_libldap}" != x -a x"${have_pthreads}" = xyes; then
+          ldap_support=yes
+          AC_SUBST(ldap_support)
+          AC_DEFINE(HAVE_LDAP, 1, [LDAP support])
+        else
+          AC_MSG_ERROR([ldap library or header is needed for LDAP compilation])
         fi
     fi
   ], [])
@@ -191,6 +213,7 @@ elif test "$ac_cv_usual_glibc_gaia" = "yes"; then
 else
   echo "  adns    = compat"
 fi
+echo "  ldap    = $ldap_support"
 echo "  pam     = $pam_support"
 echo "  systemd = $with_systemd"
 echo "  tls     = $tls_support"
