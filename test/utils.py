@@ -42,6 +42,7 @@ NEW_SITE_SCRIPT = TEST_DIR / "ssl" / "newsite.sh"
 ENABLE_VALGRIND = bool(os.environ.get("ENABLE_VALGRIND"))
 HAVE_IPV6_LOCALHOST = bool(os.environ.get("HAVE_IPV6_LOCALHOST"))
 USE_SUDO = bool(os.environ.get("USE_SUDO"))
+START_OPENLDAP_SCRIPT = TEST_DIR / "start_openldap_server.sh"
 
 # The tests require that psql can connect to the PgBouncer admin
 # console.  On platforms that have getpeereid(), this works by
@@ -131,6 +132,24 @@ def capture(command, *args, stdout=subprocess.PIPE, encoding="utf-8", **kwargs):
     return run(command, *args, stdout=stdout, encoding=encoding, **kwargs).stdout
 
 
+def wait_until(error_message="Did not complete", timeout=5, interval=0.1):
+    """
+    Loop until the timeout is reached. If the timeout is reached, raise an
+    exception with the given error message.
+    """
+    start = time.time()
+    end = start + timeout
+    last_printed_progress = start
+    while time.time() < end:
+        if timeout > 5 and time.time() - last_printed_progress > 5:
+            last_printed_progress = time.time()
+            print(f"{error_message} in {time.time() - start} seconds - will retry")
+        yield
+        time.sleep(interval)
+
+    raise TimeoutError(error_message + " in time")
+
+
 def get_pg_major_version():
     full_version_string = capture("initdb --version", silent=True)
     major_version_string = re.search("[0-9]+", full_version_string)
@@ -143,9 +162,10 @@ PG_MAJOR_VERSION = get_pg_major_version()
 
 def get_max_password_length():
     with open("../include/bouncer.h", encoding="utf-8") as f:
-        match = re.search(r"#define MAX_PASSWORD\s+([0-9])", f.read())
+        match = re.search(r"#define MAX_PASSWORD\s+([0-9].*)", f.read())
         assert match is not None
         max_password_length = int(match.group(1))
+        assert max_password_length >= 996
 
     if max_password_length > 996 and PG_MAJOR_VERSION < 14:
         return 996
@@ -154,13 +174,23 @@ def get_max_password_length():
 
 PKT_BUF_SIZE = 4096
 MAX_PASSWORD_LENGTH = get_max_password_length()
-LONG_PASSWORD = "a" * MAX_PASSWORD_LENGTH
+LONG_PASSWORD = "a" * (MAX_PASSWORD_LENGTH - 1)
 
 PG_SUPPORTS_SCRAM = PG_MAJOR_VERSION >= 10
 
 # psycopg.Pipeline.is_supported() does not work on rocky:8 in CI, so we create
 # our own check here that works on all our supported systems
 LIBPQ_SUPPORTS_PIPELINING = psycopg.pq.version() >= 140000
+
+
+def get_ldap_support():
+    with open("../config.mak", encoding="utf-8") as f:
+        match = re.search(r"ldap_support = (\w+)", f.read())
+        assert match is not None
+        return match.group(1) == "yes"
+
+
+LDAP_SUPPORT = get_ldap_support()
 
 
 def get_tls_support():
@@ -171,6 +201,7 @@ def get_tls_support():
 
 
 TLS_SUPPORT = get_tls_support()
+DIRECT_TLS_SUPPORT = TLS_SUPPORT and PG_MAJOR_VERSION >= 17
 
 
 # this is out of ephemeral port range for many systems hence
@@ -205,6 +236,9 @@ def cleanup_test_leftovers(*nodes):
 
     for node in nodes:
         node.cleanup_users()
+
+    for node in nodes:
+        node.reset_ini()
 
 
 class PortLock:
@@ -330,12 +364,13 @@ class QueryRunner:
         """
         with self.cur(**kwargs) as cur:
             cur.execute(query, params=params)
-            try:
-                return cur.fetchall()
-            except psycopg.ProgrammingError as e:
-                if "the last operation didn't produce a result" == str(e):
-                    return None
-                raise
+            if cur.pgresult and cur.pgresult.status in [
+                psycopg.pq.ExecStatus.COMMAND_OK,
+                psycopg.pq.ExecStatus.EMPTY_QUERY,
+            ]:
+                return None
+
+            return cur.fetchall()
 
     def sql_value(self, query, params=None, **kwargs):
         """Run an SQL query that returns a single cell and return this value
@@ -362,12 +397,13 @@ class QueryRunner:
     ) -> typing.Optional[typing.List[typing.Any]]:
         async with self.acur(**kwargs) as cur:
             await cur.execute(query, params=params)
-            try:
-                return await cur.fetchall()
-            except psycopg.ProgrammingError as e:
-                if "the last operation didn't produce a result" == str(e):
-                    return None
-                raise
+            if cur.pgresult and cur.pgresult.status in [
+                psycopg.pq.ExecStatus.COMMAND_OK,
+                psycopg.pq.ExecStatus.EMPTY_QUERY,
+            ]:
+                return None
+
+            return await cur.fetchall()
 
     def psql(self, query, **kwargs):
         """Run an SQL query using psql instead of psycopg
@@ -422,15 +458,15 @@ class QueryRunner:
 
     def test(self, **kwargs):
         """Test if you can connect"""
-        return self.sql("select 1", **kwargs)
+        return self.sql(";", **kwargs)
 
     def atest(self, **kwargs):
         """Test if you can connect asynchronously"""
-        return self.asql("select 1", **kwargs)
+        return self.asql(";", **kwargs)
 
     def psql_test(self, **kwargs):
         """Test if you can connect with psql instead of psycopg"""
-        return self.psql("select 1", **kwargs)
+        return self.psql(";", **kwargs)
 
     @contextmanager
     def enable_firewall(self):
@@ -449,7 +485,7 @@ class QueryRunner:
                 assert match is not None
                 fw_token = match.group(1)
             sudo(
-                'bash -c "'
+                'sh -c "'
                 f"echo 'anchor \\\"port_{self.port}\\\"'"
                 f' | pfctl -a pgbouncer_test -f -"'
             )
@@ -473,7 +509,7 @@ class QueryRunner:
                 )
             elif BSD:
                 sudo(
-                    "bash -c '"
+                    "sh -c '"
                     f'echo "block drop out proto tcp from any to {self.host} port {self.port}"'
                     f"| pfctl -a pgbouncer_test/port_{self.port} -f -'"
                 )
@@ -508,7 +544,7 @@ class QueryRunner:
                 )
             elif BSD:
                 sudo(
-                    "bash -c '"
+                    "sh -c '"
                     f'echo "block return-rst out out proto tcp from any to {self.host} port {self.port}"'
                     f"| pfctl -a pgbouncer_test/port_{self.port} -f -'"
                 )
@@ -652,6 +688,37 @@ class QueryRunner:
             ["psql", conninfo],
             silent=True,
         )
+
+
+class Proxy(QueryRunner):
+    def __init__(self, pg):
+        self.port_lock = PortLock()
+        super().__init__("127.0.0.1", self.port_lock.port)
+        self.connections = {}
+        self.pg = pg
+        self.cursors = {}
+        self.restarted = False
+        self.process: typing.Optional[subprocess.Popen] = None
+
+    def start(self):
+        command = [
+            "socat",
+            f"tcp-listen:{self.port_lock.port},reuseaddr,fork",
+            f"tcp:localhost:{self.pg.port_lock.port}",
+        ]
+        self.process = subprocess.Popen(" ".join(command), shell=True)
+
+    def stop(self):
+        self.process.kill()
+
+    def cleanup(self):
+        self.stop()
+        self.port_lock.release()
+
+    def restart(self):
+        self.restarted = True
+        self.stop()
+        self.start()
 
 
 class Postgres(QueryRunner):
@@ -927,6 +994,9 @@ class Bouncer(QueryRunner):
 
                 ini.flush()
 
+        with self.ini_path.open("r") as ini:
+            self.original_ini_contents = ini.read()
+
     def base_command(self):
         """returns the basecommand that is used to run PgBouncer
 
@@ -1126,6 +1196,16 @@ class Bouncer(QueryRunner):
         with self.ini_path.open("a") as f:
             f.write(config + "\n")
 
+    def reset_ini(self):
+        """Resets the PgBouncer config contents to their original state
+
+        Used to undo all config changes. To apply these changes PgBouncer
+        still needs to be reloaded or restarted. To reload in a cross platform
+        way you need can use admin("reload").
+        """
+        with self.ini_path.open("w") as f:
+            f.write(self.original_ini_contents)
+
     @contextmanager
     def log_contains(self, re_string, times=None):
         """Checks if during this with block the log matches re_string
@@ -1168,3 +1248,34 @@ class Bouncer(QueryRunner):
             with self.ini_path.open("w") as f:
                 f.write(config_old)
             self.admin("RELOAD")
+
+
+class OpenLDAP:
+    def __init__(self, config_dir):
+        self.ldap_port_lock = PortLock()
+        self.ldaps_port_lock = PortLock()
+        self.config_dir = config_dir
+        self.slapd_pid_file = self.config_dir / "ldap" / "slapd.pid"
+
+    def startup(self):
+        run(
+            f"{START_OPENLDAP_SCRIPT} {self.config_dir} {self.ldap_port_lock.port} {self.ldaps_port_lock.port}"
+        )
+
+    @property
+    def ldap_port(self):
+        return self.ldap_port_lock.port
+
+    @property
+    def ldaps_port(self):
+        return self.ldaps_port_lock.port
+
+    def stop(self):
+        with self.slapd_pid_file.open("r") as pid_file:
+            pid = pid_file.read()
+        os.kill(int(pid), signal.SIGTERM)
+
+    def cleanup(self):
+        self.stop()
+        self.ldap_port_lock.release()
+        self.ldaps_port_lock.release()

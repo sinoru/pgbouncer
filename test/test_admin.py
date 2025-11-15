@@ -1,10 +1,43 @@
+import threading
 import time
 
 import psycopg
 import pytest
 from psycopg.rows import dict_row
 
-from .utils import capture, run
+from .utils import Bouncer, capture, run
+
+
+def test_reload_error(bouncer):
+    """
+    Test that admin console correctly raises error during RELOAD
+    when invalid value set for auth_type.
+    """
+    config = f"""
+    [databases]
+    p1 = host={bouncer.pg.host} port={bouncer.pg.port}
+
+    [pgbouncer]
+    listen_addr = {bouncer.host}
+    listen_port = {bouncer.port}
+    auth_type = trust
+    admin_users = pgbouncer
+    logfile = {bouncer.log_path}
+    auth_file = {bouncer.auth_path}
+    pool_mode = session
+    server_lifetime = {{server_lifetime}}
+    """
+    good_config = config.format(server_lifetime=0)
+    bad_config = config.format(server_lifetime="invalid_server_lifetime")
+    with bouncer.run_with_config(good_config):
+        with bouncer.ini_path.open("w") as f:
+            f.write(bad_config)
+
+        with pytest.raises(
+            psycopg.errors.ConfigFileError,
+            match=r"RELOAD failed, see logs for additional details",
+        ):
+            bouncer.admin("RELOAD")
 
 
 def test_show(bouncer):
@@ -143,6 +176,137 @@ def test_client_id(bouncer) -> None:
             assert [
                 initial_id + i,
             ] == [client["id"] for client in clients]
+
+
+def test_client_states(bouncer):
+    conn_1 = bouncer.conn(dbname="p3x", user="clientstate")
+
+    clients = bouncer.admin("SHOW CLIENTS", row_factory=dict_row)
+    client_id = [
+        client
+        for client in clients
+        if client["database"] == "p3x" and client["user"] == "clientstate"
+    ][0]["state"]
+    assert client_id == "idle"
+
+    cur_1 = conn_1.cursor()
+
+    bouncer.admin("PAUSE p3x")
+
+    # Give a moment for the query to hit the pause
+    time.sleep(1)
+
+    # We'll run a query in a separate thread to simulate blocking/waiting
+    def run_blocked_query():
+        # This query will attempt to run but the DB is paused
+        cur_1.execute("SELECT pg_sleep(5)")
+        # If the DB is never resumed, this call will block until test times out
+        # Once the DB is resumed, it should succeed
+        cur_1.fetchone()
+
+    thread = threading.Thread(target=run_blocked_query)
+    thread.start()
+
+    # Give the thread a moment to attempt the query
+    time.sleep(1)
+
+    clients = bouncer.admin("SHOW CLIENTS", row_factory=dict_row)
+    client_id = [
+        client
+        for client in clients
+        if client["database"] == "p3x" and client["user"] == "clientstate"
+    ][0]["state"]
+    assert client_id == "waiting"
+
+    bouncer.admin("RESUME p3x")
+
+    # Wait for the thread to finish the blocked query
+    thread.join(timeout=10)
+    # Confirm the query eventually completes
+    assert not thread.is_alive(), "Expected the blocked query thread to finish"
+
+    cur_1.execute("BEGIN; SELECT pg_sleep(5);")
+
+    clients = bouncer.admin("SHOW CLIENTS", row_factory=dict_row)
+    client_id = [
+        client
+        for client in clients
+        if client["database"] == "p3x" and client["user"] == "clientstate"
+    ][0]["state"]
+    assert client_id == "active"
+
+    # Rollback/commit to end the long-running transaction
+    cur_1.execute("ROLLBACK")
+
+    # Cleanup
+    cur_1.close()
+    conn_1.close()
+
+
+def test_kill_db(bouncer: "Bouncer"):
+    # Connect to client as user A
+    conn_1 = bouncer.conn(dbname="p0", user="maxedout")
+
+    # Connect to client as user B
+    conn_2 = bouncer.conn(dbname="p0", user="maxedout")
+
+    # Validate count
+    clients = bouncer.admin("SHOW CLIENTS", row_factory=dict_row)
+    assert len(clients) == 3
+
+    # Issue kill command
+    bouncer.admin("KILL p0")
+
+    # Validate count
+    clients = bouncer.admin("SHOW CLIENTS")
+    assert len(clients) == 1
+
+    conn_1.close()
+    conn_2.close()
+
+
+def test_kill_db_nonexisting(bouncer: "Bouncer"):
+    # Connect to client as user A
+    conn_1 = bouncer.conn(dbname="p0", user="maxedout")
+
+    # Validate count
+    clients = bouncer.admin("SHOW CLIENTS", row_factory=dict_row)
+    assert len(clients) == 2
+
+    # Issue kill command
+    with pytest.raises(
+        psycopg.errors.ProtocolViolation,
+        match=r"no such database: dne",
+    ):
+        clients = bouncer.admin("KILL dne")
+
+    # Validate count
+    clients = bouncer.admin("SHOW CLIENTS")
+    assert len(clients) == 2
+
+    conn_1.close()
+
+
+def test_kill_all(bouncer: "Bouncer"):
+    # Connect to client as user A to first database
+    conn_1 = bouncer.conn(dbname="p0", user="maxedout")
+
+    # Connect to client as user B to second database
+    conn_2 = bouncer.conn(dbname="p1", user="maxedout")
+
+    # Validate count
+    clients = bouncer.admin("SHOW CLIENTS", row_factory=dict_row)
+    assert len(clients) == 3
+
+    # Issue kill command
+    bouncer.admin("KILL")
+
+    # Validate count
+    clients = bouncer.admin("SHOW CLIENTS")
+    assert len(clients) == 1
+
+    conn_1.close()
+    conn_2.close()
 
 
 def test_kill_client_nonexisting(bouncer):

@@ -32,6 +32,11 @@
 #include <event2/event.h>
 #include <event2/event_struct.h>
 
+// Needed by cryptohash.h
+#define uint8 uint8_t
+#include "common/cryptohash.h"
+#undef uint8
+
 /*
  * By default uthash exits the program when an allocation fails. But for some
  * of our hashmap usecases we don't want that. Luckily you can install your own
@@ -41,7 +46,7 @@
  * in C files where we want to handle allocation failures differently.
  */
 #define HASH_NONFATAL_OOM 1
-#include "uthash.h"
+#include "common/uthash.h"
 #undef uthash_nonfatal_oom
 #define uthash_nonfatal_oom(elt) fatal("out of memory")
 
@@ -183,6 +188,7 @@ extern int cf_sbuf_len;
 #include "takeover.h"
 #include "janitor.h"
 #include "hba.h"
+#include "ldapauth.h"
 #include "messages.h"
 #include "pam.h"
 #include "prepare.h"
@@ -215,6 +221,11 @@ extern int cf_sbuf_len;
  */
 #define MAX_PASSWORD    2048
 
+#ifdef HAVE_LDAP
+/* Hope this length is long enough for ldap config line */
+#define MAX_LDAP_CONFIG 1024
+#endif
+
 /*
  * Symbols for authentication type settings (auth_type, hba).
  */
@@ -225,6 +236,7 @@ enum auth_type {
 	AUTH_TYPE_MD5,
 	AUTH_TYPE_CERT,
 	AUTH_TYPE_HBA,
+	AUTH_TYPE_LDAP,
 	AUTH_TYPE_PAM,
 	AUTH_TYPE_SCRAM_SHA_256,
 	AUTH_TYPE_PEER,
@@ -498,9 +510,6 @@ struct PgCredentials {
 	struct AANode tree_node;	/* used to attach user to tree */
 	char name[MAX_USERNAME];
 	char passwd[MAX_PASSWORD];
-	uint8_t scram_ClientKey[32];
-	uint8_t scram_ServerKey[32];
-	bool has_scram_keys;		/* true if the above two are valid */
 	bool mock_auth;			/* not a real user, only for mock auth */
 	bool dynamic_passwd;		/* does the password need to be refreshed every use */
 
@@ -509,6 +518,22 @@ struct PgCredentials {
 	 * settings and connection count tracking.
 	 */
 	PgGlobalUser *global_user;
+
+	/* scram keys used for pass-though and adhoc auth caching */
+	uint8_t scram_ClientKey[32];
+	uint8_t scram_ServerKey[32];
+	uint8_t scram_StoredKey[32];
+	int scram_Iiterations;
+	char *scram_SaltKey;	/* base64-encoded */
+
+	/* true if ClientKey and ServerKey are valid and scram pass-though is in use. */
+	bool use_scram_keys;
+
+	/*
+	 * true if ServerKey, StoredKey, Salt and Iterations is cached for
+	 * adhoc scram authentication.
+	 */
+	bool adhoc_scram_secrets_cached;
 };
 
 /*
@@ -529,6 +554,7 @@ struct PgGlobalUser {
 	int pool_size;	/* max server connections in one pool */
 	int res_pool_size;	/* max additional server connections in one pool */
 
+	usec_t transaction_timeout;	/* how long a user is allowed to stay in transaction before being killed */
 	usec_t idle_transaction_timeout;	/* how long a user is allowed to stay idle in transaction before being killed */
 	usec_t query_timeout;	/* how long a users query is allowed to run before beign killed */
 	usec_t client_idle_timeout;	/* how long is user allowed to idly connect to pgbouncer */
@@ -662,11 +688,14 @@ struct PgSocket {
 	bool copy_mode : 1;		/* server: in copy stream, ignores any Sync packets until CopyDone or CopyFail */
 
 	bool wait_for_welcome : 1;	/* client: no server yet in pool, cannot send welcome msg */
+	bool welcome_sent : 1;		/* client: client has been sent the welcome msg */
 	bool wait_for_user_conn : 1;	/* client: waiting for auth_conn server connection */
 	bool wait_for_user : 1;		/* client: waiting for auth_conn query results */
-	bool wait_for_auth : 1;		/* client: waiting for external auth (PAM) to be completed */
+	bool wait_for_auth : 1;		/* client: waiting for external auth (PAM/LDAP) to be completed */
 
 	bool suspended : 1;		/* client/server: if the socket is suspended */
+
+	bool sent_wait_notification : 1;/* client: whether client has been alerted that it is queued */
 
 	bool admin_user : 1;		/* console client: has admin rights */
 	bool own_user : 1;		/* console client: client with same uid on unix socket */
@@ -693,26 +722,40 @@ struct PgSocket {
 	PgAddr remote_addr;	/* ip:port for remote endpoint */
 	PgAddr local_addr;	/* ip:port for local endpoint */
 
+	char *host;
+
 	union {
 		struct DNSToken *dns_token;	/* ongoing request */
 		PgDatabase *db;			/* cache db while doing auth query */
 	};
 
 	struct ScramState {
+		/* Common fields used in both client and server roles */
 		char *client_nonce;
 		char *client_first_message_bare;
 		char *client_final_message_without_proof;
 		char *server_nonce;
 		char *server_first_message;
+		int iterations;
+		pg_cryptohash_type hash_type;
+		int key_length;
+
+		/* Client-side fields (when PgBouncer connects to PostgreSQL) */
+		uint8_t *salt;	/* binary salt */
+		int saltlen;	/* length of salt */
 		uint8_t *SaltedPassword;
+
+		/* Server-side fields (when clients connect to PgBouncer) */
 		char cbind_flag;
 		bool adhoc;	/* SCRAM data made up from plain-text password */
-		int iterations;
-		char *salt;	/* base64-encoded */
-		uint8_t ClientKey[32];	/* SHA256_DIGEST_LENGTH */
+		char *encoded_salt;	/* base64-encoded salt for server messages */
+		uint8_t ClientKey[32];
 		uint8_t StoredKey[32];
 		uint8_t ServerKey[32];
 	} scram_state;
+#ifdef HAVE_LDAP
+	char ldap_options[MAX_LDAP_CONFIG];
+#endif
 
 	VarCache vars;		/* state of interesting server parameters */
 
@@ -752,7 +795,7 @@ struct PgSocket {
 
 /* main.c */
 extern int cf_daemon;
-
+extern long unsigned int cf_query_wait_notify;
 extern char *cf_config_file;
 extern char *cf_jobname;
 
@@ -784,6 +827,7 @@ extern usec_t cf_server_idle_timeout;
 extern char *cf_server_reset_query;
 extern int cf_server_reset_query_always;
 extern char *cf_server_check_query;
+extern bool empty_server_check_query;
 extern usec_t cf_server_check_delay;
 extern int cf_server_fast_close;
 extern usec_t cf_server_connect_timeout;
@@ -794,6 +838,7 @@ extern usec_t cf_cancel_wait_timeout;
 extern usec_t cf_client_idle_timeout;
 extern usec_t cf_client_login_timeout;
 extern usec_t cf_idle_transaction_timeout;
+extern usec_t cf_transaction_timeout;
 extern bool any_user_level_timeout_set;
 extern bool any_user_level_client_timeout_set;
 extern int cf_server_round_robin;
@@ -809,6 +854,7 @@ extern char *cf_auth_query;
 extern char *cf_auth_user;
 extern char *cf_auth_hba_file;
 extern char *cf_auth_dbname;
+extern char *cf_auth_ldap_options;
 
 extern char *cf_pidfile;
 
@@ -846,6 +892,7 @@ extern char *cf_client_tls_ca_file;
 extern char *cf_client_tls_cert_file;
 extern char *cf_client_tls_key_file;
 extern char *cf_client_tls_ciphers;
+extern char *cf_client_tls13_ciphers;
 extern char *cf_client_tls_dheparams;
 extern char *cf_client_tls_ecdhecurve;
 
@@ -855,6 +902,7 @@ extern char *cf_server_tls_ca_file;
 extern char *cf_server_tls_cert_file;
 extern char *cf_server_tls_key_file;
 extern char *cf_server_tls_ciphers;
+extern char *cf_server_tls13_ciphers;
 
 extern int cf_max_prepared_statements;
 
@@ -865,14 +913,6 @@ extern usec_t g_suspend_start;
 
 extern struct DNSContext *adns;
 extern struct HBA *parsed_hba;
-
-static inline PgSocket * _MUSTCHECK pop_socket(struct StatList *slist)
-{
-	struct List *item = statlist_pop(slist);
-	if (item == NULL)
-		return NULL;
-	return container_of(item, PgSocket, head);
-}
 
 static inline PgSocket *first_socket(struct StatList *slist)
 {
@@ -901,7 +941,7 @@ static inline char *cstr_skip_ws(char *p)
 }
 
 
-void load_config(void);
+bool load_config(void);
 
 
 bool set_config_param(const char *key, const char *val);

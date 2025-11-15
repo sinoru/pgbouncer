@@ -1,8 +1,90 @@
 PgBouncer changelog
 ===================
 
+PgBouncer 1.25.x
+----------------
+
+**2025-11-09  -  PgBouncer 1.25.0  -  "The one with LDAP support"**
+
+- Features
+    * Add LDAP authentication! You can configure it using an HBA file or using `auth_ldap_options`. ([#731])
+    * Add support for client-side direct TLS connections. This allows clients to using the faster TLS connection setup that was introduced in PostgreSQL 17. PgBouncer cannot (yet) connect to PostgreSQL servers using this faster connection setup. ([#1359])
+    * Add idle state to `SHOW CLIENTS`. ([#1191])
+    * Add `transaction_timeout` setting, both globally and at the user level. ([#1242])
+    * Send a NOTICE message to the client if it is queued without receiving a connection for more than 5 seconds. This duration can be changed/disabled using `query_wait_notify`. ([#1264])
+    * Add `scram_iterations` setting to allow operators to trade security for authentication speed ([#1339])
+    * Add `client_tls13_ciphers` and `server_tls13_ciphers` to choose which TLSv1.3 cipher suites to enable. ([#1352])
+- Changes
+    * Greatly improve performance of ad hoc SCRAM authentication. ([#1338])
+    * Allow `KILL` to not take any database, which now means to `KILL` all databases. ([#1317])
+    * Health check query defaults to sending empty query instead of `SELECT 1`. ([#1233])
+    * Log full PAM queue as a warning. This makes it easier to find the cause of slow queries caused by this. ([#1297])
+    * The `RELOAD` command now reports any errors that happened during the reload. ([#1231])
+    * Enable access to the PgBouncer UNIX socket during shutdown for admin connections. This makes it easier for an operator to find out why a PgBouncer process is not shutting down and/or manually run `KILL_CLIENT` for stuck connections. ([#1305])
+    * Change `mkauth.py` to not add an obsolete third field anymore ([#1365])
+    * Improve `FATAL` messages in `disconnect_client` and `disconnect_server` functions. ([#1382])
+    * Stop using deprecated OpenSSL function `EVP_PKEY_get0_EC_KEY`. This could cause issues with certain FIPS implementatinos. ([#1384])
+- Fixes
+    * Fix crash involving long passwords (1024 characters or more). ([#1215])
+    * Fix multi-host connections when using `server_tls_sslmode=verify-full`. ([#1303])
+    * Fix rare `FATAL` error when forwarding cancel requests. ([#1383])
+    * Fix sorting of parameters in `SHOW CONFIG`. ([#1403])
+    * Harden parsing of the startup packet. ([#1407])
+
+[#731]: https://github.com/pgbouncer/pgbouncer/pull/731
+[#1191]: https://github.com/pgbouncer/pgbouncer/pull/1191
+[#1215]: https://github.com/pgbouncer/pgbouncer/pull/1215
+[#1231]: https://github.com/pgbouncer/pgbouncer/pull/1231
+[#1233]: https://github.com/pgbouncer/pgbouncer/pull/1233
+[#1242]: https://github.com/pgbouncer/pgbouncer/pull/1242
+[#1264]: https://github.com/pgbouncer/pgbouncer/pull/1264
+[#1297]: https://github.com/pgbouncer/pgbouncer/pull/1297
+[#1303]: https://github.com/pgbouncer/pgbouncer/pull/1303
+[#1305]: https://github.com/pgbouncer/pgbouncer/pull/1305
+[#1317]: https://github.com/pgbouncer/pgbouncer/pull/1317
+[#1338]: https://github.com/pgbouncer/pgbouncer/pull/1338
+[#1339]: https://github.com/pgbouncer/pgbouncer/pull/1339
+[#1352]: https://github.com/pgbouncer/pgbouncer/pull/1352
+[#1359]: https://github.com/pgbouncer/pgbouncer/pull/1359
+[#1365]: https://github.com/pgbouncer/pgbouncer/pull/1365
+[#1382]: https://github.com/pgbouncer/pgbouncer/pull/1382
+[#1383]: https://github.com/pgbouncer/pgbouncer/pull/1383
+[#1384]: https://github.com/pgbouncer/pgbouncer/pull/1384
+[#1403]: https://github.com/pgbouncer/pgbouncer/pull/1403
+[#1407]: https://github.com/pgbouncer/pgbouncer/pull/1407
+
 PgBouncer 1.24.x
 ----------------
+
+**2025-04-16  -  PgBouncer 1.24.1  -  "CVE-2025-2291 VALID UNTIL yesterday"**
+
+- Security
+  * Fix CVE-2025-2291: Previously PgBouncer did not take into account the VALID
+    UNTIL of a user password when querying for password hashes using its
+    auth_query. So if PgBouncer is used as a transparent proxy in front of
+    Postgres it could allow passwords that had already expired. To solve this
+    issue the default auth_query and the examples of custom auth_query functions
+    in the documentation have been changed to take VALID UNTIL into account. If
+    you are using a custom auth_query you should update that accordingly. If
+    you are using the default auth_query, you can either update to PgBouncer
+    1.24.1 or change your config to use the new default auth_query on a
+    previous release of PgBouncer.
+
+- Fixes
+  * Fix PAM support by reverting `pam` authentication support in HBA file. ([#1291]) (bug introduced in 1.24.0)
+  * Fix bug when decrementing user connection count. This was included in the tag of 1.24.0 on GitHub, but the release tarball did not contain this fix.  ([#1238]) (bug introduced in 1.24.0)
+  * Add `test_load_balance_hosts.py` to the tarball. ([#1282])
+  * Fix issues with tests to allow them to be run by Debian packagers. ([#1266], [#1250])
+
+- Docs
+  * Update `auth_query` example to set a safe `search_path`. ([#1245])
+
+[#1238]: https://github.com/pgbouncer/pgbouncer/pull/1238
+[#1291]: https://github.com/pgbouncer/pgbouncer/pull/1291
+[#1282]: https://github.com/pgbouncer/pgbouncer/pull/1282
+[#1266]: https://github.com/pgbouncer/pgbouncer/pull/1266
+[#1250]: https://github.com/pgbouncer/pgbouncer/pull/1250
+[#1245]: https://github.com/pgbouncer/pgbouncer/pull/1245
 
 **2025-01-10  -  PgBouncer 1.24.0  -  "New year, new bouncer"**
 
