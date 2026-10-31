@@ -1,4 +1,4 @@
-FROM alpine:3.21 AS base
+FROM alpine:3.24 AS base
 ARG TARGETPLATFORM
 
 RUN \
