@@ -12,101 +12,87 @@ from .utils import LIBPQ_SUPPORTS_PIPELINING, LINUX, PKT_BUF_SIZE, USE_SUDO
 def test_prepared_statement(bouncer):
     bouncer.admin(f"set pool_mode=transaction")
     prepared_query = "SELECT 1"
-    with bouncer.cur() as cur1:
-        with bouncer.cur() as cur2:
-            # prepare query on server 1 and client 1
-            cur1.execute(prepared_query, prepare=True)
-            # Run the prepared query again on same server and client
+    with bouncer.cur() as cur1, bouncer.cur() as cur2:
+        # prepare query on server 1 and client 1
+        cur1.execute(prepared_query, prepare=True)
+        # Run the prepared query again on same server and client
+        cur1.execute(prepared_query)
+        with cur2.connection.transaction():
+            # Claim server 1 with client 2
+            cur2.execute("SELECT 2")
+            # Client 1 now runs the prepared query, and it's automatically
+            # prepared on server 2
             cur1.execute(prepared_query)
-            with cur2.connection.transaction():
-                # Claim server 1 with client 2
-                cur2.execute("SELECT 2")
-                # Client 1 now runs the prepared query, and it's automatically
-                # prepared on server 2
-                cur1.execute(prepared_query)
-                # Client 2 now prepares the same query that was already
-                # prepared on server 1. And PgBouncer reuses that already
-                # prepared query for this different client.
-                cur2.execute(prepared_query, prepare=True)
+            # Client 2 now prepares the same query that was already
+            # prepared on server 1. And PgBouncer reuses that already
+            # prepared query for this different client.
+            cur2.execute(prepared_query, prepare=True)
 
 
 def test_prepared_statement_params(bouncer):
     bouncer.admin(f"set pool_mode=transaction")
     prepared_query = "SELECT %s"
-    with bouncer.cur() as cur1:
-        with bouncer.cur() as cur2:
-            # prepare query on server 1 and client 1
-            cur1.execute(prepared_query, params=(1,), prepare=True)
-            # Run the prepared query again on same server and client
+    with bouncer.cur() as cur1, bouncer.cur() as cur2:
+        # prepare query on server 1 and client 1
+        cur1.execute(prepared_query, params=(1,), prepare=True)
+        # Run the prepared query again on same server and client
+        cur1.execute(prepared_query, params=(1,))
+        with cur2.connection.transaction():
+            # Claim server 1 with client 2
+            cur2.execute("SELECT 2")
+            # Client 1 now runs the prepared query, and it's automatically
+            # prepared on server 2
             cur1.execute(prepared_query, params=(1,))
-            with cur2.connection.transaction():
-                # Claim server 1 with client 2
-                cur2.execute("SELECT 2")
-                # Client 1 now runs the prepared query, and it's automatically
-                # prepared on server 2
-                cur1.execute(prepared_query, params=(1,))
-                # Client 2 now prepares the same query that was already
-                # prepared on server 1. And PgBouncer reuses that already
-                # prepared query for this different client.
-                cur2.execute(prepared_query, params=(1,), prepare=True)
+            # Client 2 now prepares the same query that was already
+            # prepared on server 1. And PgBouncer reuses that already
+            # prepared query for this different client.
+            cur2.execute(prepared_query, params=(1,), prepare=True)
 
 
-def test_deallocate_all(bouncer):
+@pytest.mark.parametrize("command", ["DISCARD ALL", "DEALLOCATE ALL"])
+def test_discard_or_deallocate_all(bouncer, command):
+    """
+    Client sends a "DEALLOCATE ALL" command (or "DISCARD ALL", which has the
+    same effect). pgbouncer recognizes it and resets the client's prepared
+    statement cache. This scenario is implemented with raw libpq calls to
+    bypass psycopg's special DISCARD ALL handling.
+    """
     bouncer.admin(f"set pool_mode=transaction")
-    prepared_query = "SELECT 1"
-    with bouncer.cur() as cur1:
-        with bouncer.cur() as cur2:
-            # prepare query on client 1
-            cur1.execute(prepared_query, prepare=True)
-            # Run the prepared query again on same server and client
-            cur1.execute(prepared_query)
+    with bouncer.conn() as conn1, bouncer.conn() as conn2:
+        # prepare and execute query on client 1
+        result = conn1.pgconn.prepare(b"mystmt", b"SELECT 1")
+        assert result.status == pq.ExecStatus.COMMAND_OK
 
-            # prepared query for client 2
-            cur2.execute(prepared_query, prepare=True)
+        result = conn1.pgconn.exec_prepared(b"mystmt", ())
+        assert result.status == pq.ExecStatus.TUPLES_OK
+        assert result.get_value(0, 0) == b"1"
 
-            # execute DEALLOCATE ALL on client 1
-            cur1.execute("DEALLOCATE ALL")
+        # prepare and execute query on client 2
+        result = conn2.pgconn.prepare(b"mystmt", b"SELECT 2")
+        assert result.status == pq.ExecStatus.COMMAND_OK
 
-            # Run the prepared query again on server 2 and client 2
-            cur2.execute(prepared_query)
+        result = conn2.pgconn.exec_prepared(b"mystmt", ())
+        assert result.status == pq.ExecStatus.TUPLES_OK
+        assert result.get_value(0, 0) == b"2"
 
-            # Confirm that the prepared query is not available anymore on
-            # client 1
-            with bouncer.log_contains("prepared statement did not exist"):
-                with pytest.raises(
-                    psycopg.OperationalError,
-                    match="prepared statement did not exist|server closed the connection unexpectedly",
-                ):
-                    cur1.execute(prepared_query)
+        # execute DISCARD / DEALLOCATE ALL on client 1
+        result = conn1.pgconn.exec_(command.encode("utf-8"))
+        assert result.status == pq.ExecStatus.COMMAND_OK
 
+        # Execute the prepared query again on client 2
+        result = conn2.pgconn.exec_prepared(b"mystmt", ())
+        assert result.status == pq.ExecStatus.TUPLES_OK
+        assert result.get_value(0, 0) == b"2"
 
-def test_discard_all(bouncer):
-    bouncer.admin(f"set pool_mode=transaction")
-    prepared_query = "SELECT 1"
-    with bouncer.cur() as cur1:
-        with bouncer.cur() as cur2:
-            # prepare query on client 1
-            cur1.execute(prepared_query, prepare=True)
-            # Run the prepared query again on same server and client
-            cur1.execute(prepared_query)
-
-            # prepared query for client 2
-            cur2.execute(prepared_query, prepare=True)
-
-            # execute DISCARD ALL on client 1
-            cur1.execute("DISCARD ALL")
-
-            # Run the prepared query again on server 2 and client 2
-            cur2.execute(prepared_query)
-
-            # Confirm that the prepared query is not available anymore on
-            # client 1
-            with bouncer.log_contains("prepared statement did not exist"):
-                with pytest.raises(
-                    psycopg.OperationalError,
-                    match="prepared statement did not exist|server closed the connection unexpectedly",
-                ):
-                    cur1.execute(prepared_query)
+        # Confirm that the prepared query is not available anymore on
+        # client 1
+        with bouncer.log_contains("prepared statement did not exist"):
+            result = conn1.pgconn.exec_prepared(b"mystmt", ())
+        assert result.status == pq.ExecStatus.FATAL_ERROR
+        assert (
+            b"prepared statement did not exist" in result.error_message
+            or b"server closed the connection unexpectedly" in result.error_message
+        )
 
 
 def test_parse_larger_than_pkt_buf(bouncer):
@@ -223,17 +209,16 @@ def test_evict_statement_cache(bouncer):
 def test_evict_statement_cache_pipeline_failure(bouncer):
     bouncer.admin(f"set max_prepared_statements=1")
 
-    with bouncer.conn() as conn:
-        with conn.pipeline() as p:
-            curs = [conn.cursor() for _ in range(4)]
-            curs[0].execute("SELECT 1", prepare=True)
-            curs[1].execute("bad query", prepare=True)
-            with pytest.raises(psycopg.errors.SyntaxError):
-                p.sync()
-            assert curs[0].fetchall() == [(1,)]
-            curs[0].execute("SELECT 1", prepare=True)
+    with bouncer.conn() as conn, conn.pipeline() as p:
+        curs = [conn.cursor() for _ in range(4)]
+        curs[0].execute("SELECT 1", prepare=True)
+        curs[1].execute("bad query", prepare=True)
+        with pytest.raises(psycopg.errors.SyntaxError):
             p.sync()
-            assert curs[0].fetchall() == [(1,)]
+        assert curs[0].fetchall() == [(1,)]
+        curs[0].execute("SELECT 1", prepare=True)
+        p.sync()
+        assert curs[0].fetchall() == [(1,)]
 
 
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
@@ -245,30 +230,28 @@ def test_prepared_statement_pipeline(bouncer):
         assert result == 1
 
     # Try with a prepared query first and a unprepared query second
-    with bouncer.conn() as conn:
-        with conn.pipeline():
-            curs = [conn.cursor() for _ in range(4)]
-            curs[0].execute("SELECT 2", prepare=True)
-            curs[1].execute(prepared_query, prepare=True)
-            curs[2].execute("SELECT 3")
-            curs[3].execute(prepared_query, prepare=True)
-            assert curs[0].fetchall() == [(2,)]
-            assert curs[1].fetchall() == [(1,)]
-            assert curs[2].fetchall() == [(3,)]
-            assert curs[3].fetchall() == [(1,)]
+    with bouncer.conn() as conn, conn.pipeline():
+        curs = [conn.cursor() for _ in range(4)]
+        curs[0].execute("SELECT 2", prepare=True)
+        curs[1].execute(prepared_query, prepare=True)
+        curs[2].execute("SELECT 3")
+        curs[3].execute(prepared_query, prepare=True)
+        assert curs[0].fetchall() == [(2,)]
+        assert curs[1].fetchall() == [(1,)]
+        assert curs[2].fetchall() == [(3,)]
+        assert curs[3].fetchall() == [(1,)]
 
     # Try with a unprepared query first and a prepared query second
-    with bouncer.conn() as conn:
-        with conn.pipeline(), conn.cursor() as cur:
-            curs = [conn.cursor() for _ in range(4)]
-            curs[0].execute("SELECT 2", prepare=True)
-            curs[1].execute(prepared_query, prepare=True)
-            curs[2].execute("SELECT 3")
-            curs[3].execute(prepared_query, prepare=True)
-            assert curs[0].fetchall() == [(2,)]
-            assert curs[1].fetchall() == [(1,)]
-            assert curs[2].fetchall() == [(3,)]
-            assert curs[3].fetchall() == [(1,)]
+    with bouncer.conn() as conn, conn.pipeline(), conn.cursor() as cur:
+        curs = [conn.cursor() for _ in range(4)]
+        curs[0].execute("SELECT 2", prepare=True)
+        curs[1].execute(prepared_query, prepare=True)
+        curs[2].execute("SELECT 3")
+        curs[3].execute(prepared_query, prepare=True)
+        assert curs[0].fetchall() == [(2,)]
+        assert curs[1].fetchall() == [(1,)]
+        assert curs[2].fetchall() == [(3,)]
+        assert curs[3].fetchall() == [(1,)]
 
 
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
@@ -283,21 +266,20 @@ def test_prepared_statement_pipeline_stress(bouncer):
 
     for pipeline_length in range(max_pipeline_length):
         # Try with a prepared query first and a unprepared query second
-        with bouncer.conn() as conn:
-            with conn.pipeline():
-                curs = [conn.cursor() for _ in range(pipeline_length)]
-                for _ in range(n_iterations):
-                    for i in range(pipeline_length):
-                        stmt_id = random.randint(1, max_prepared_stmt)
-                        curs[i].execute(
-                            sql.SQL("SELECT %s, %s::text as {}").format(
-                                sql.Identifier(f"s{stmt_id}")
-                            ),
-                            params=(i, str(i).zfill(size_of_param)),
-                            prepare=True,
-                        )
-                    for i in range(pipeline_length):
-                        assert curs[i].fetchall() == [(i, str(i).zfill(size_of_param))]
+        with bouncer.conn() as conn, conn.pipeline():
+            curs = [conn.cursor() for _ in range(pipeline_length)]
+            for _ in range(n_iterations):
+                for i in range(pipeline_length):
+                    stmt_id = random.randint(1, max_prepared_stmt)
+                    curs[i].execute(
+                        sql.SQL("SELECT %s, %s::text as {}").format(
+                            sql.Identifier(f"s{stmt_id}")
+                        ),
+                        params=(i, str(i).zfill(size_of_param)),
+                        prepare=True,
+                    )
+                for i in range(pipeline_length):
+                    assert curs[i].fetchall() == [(i, str(i).zfill(size_of_param))]
 
 
 def test_describe_non_existent_prepared_statement(bouncer):
@@ -328,6 +310,108 @@ def test_close_prepared_statement(bouncer):
         # describe it.
         result = conn.pgconn.describe_prepared(b"test")
         assert result.status == pq.ExecStatus.FATAL_ERROR
+
+
+def collect_pipeline_results(pgconn, max_results=20):
+    """Collect the pipeline result statuses, up to and including the sync.
+
+    None means the current command has no more results. The limit makes a
+    missing result fail the test instead of hang it.
+    """
+    statuses = []
+    for _ in range(max_results):
+        result = pgconn.get_result()
+        if result is None:
+            continue
+        statuses.append(result.status)
+        if result.status == pq.ExecStatus.PIPELINE_SYNC:
+            return statuses
+    raise AssertionError(f"no pipeline sync after {max_results} results: {statuses}")
+
+
+# libpq before PG17 does not support sending Close messages
+@pytest.mark.skipif("psycopg.pq.version() < 170000")
+@pytest.mark.skipif(
+    "psycopg.__version__ < '3.2.0'",
+    reason="Debian oldstable doesn't support a version of psycopg with 'close_prepared' support",
+)
+@pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
+@pytest.mark.timeout(60)
+def test_close_batched_with_reused_parse(bouncer):
+    """Close in a batch with a Parse that PgBouncer answers itself.
+
+    PgBouncer sends nothing to the server for a Close, or for a Parse of a
+    query that is already prepared. It makes both replies itself. The client
+    must get them in the order that it asked for.
+    """
+    bouncer.admin("set max_prepared_statements=100")
+
+    with bouncer.conn() as conn:
+        pgconn = conn.pgconn
+
+        # Prepare the query on the server link. PgBouncer then answers the
+        # Parse below and does not forward it.
+        result = pgconn.prepare(b"a", b"SELECT 1")
+        assert result.status == pq.ExecStatus.COMMAND_OK
+
+        pgconn.enter_pipeline_mode()
+        pgconn.send_prepare(b"b", b"SELECT 1")
+        pgconn.send_close_prepared(b"a")
+        pgconn.pipeline_sync()
+
+        assert collect_pipeline_results(pgconn) == [
+            pq.ExecStatus.COMMAND_OK,
+            pq.ExecStatus.COMMAND_OK,
+            pq.ExecStatus.PIPELINE_SYNC,
+        ]
+        pgconn.exit_pipeline_mode()
+
+        # The connection must still work. A wrong order breaks it permanently.
+        result = pgconn.exec_(b"SELECT 2")
+        assert result.status == pq.ExecStatus.TUPLES_OK
+        assert result.get_value(0, 0) == b"2"
+
+
+# libpq before PG17 does not support sending Close messages
+@pytest.mark.skipif("psycopg.pq.version() < 170000")
+@pytest.mark.skipif(
+    "psycopg.__version__ < '3.2.0'",
+    reason="Debian oldstable doesn't support a version of psycopg with 'close_prepared' support",
+)
+@pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
+@pytest.mark.timeout(60)
+def test_close_batched_with_evicting_parse(bouncer):
+    """Close in a batch with a Parse that evicts a statement.
+
+    A Parse into a full cache makes PgBouncer send its own Close to the server
+    and discard the CloseComplete. The discard must not delay the CloseComplete
+    that the client waits for.
+    """
+    bouncer.admin("set max_prepared_statements=1")
+
+    with bouncer.conn() as conn:
+        pgconn = conn.pgconn
+
+        result = pgconn.prepare(b"a", b"SELECT 1")
+        assert result.status == pq.ExecStatus.COMMAND_OK
+
+        pgconn.enter_pipeline_mode()
+        # A different query. PgBouncer forwards this Parse, which fills the
+        # cache above its limit of one.
+        pgconn.send_prepare(b"b", b"SELECT 2")
+        pgconn.send_close_prepared(b"a")
+        pgconn.pipeline_sync()
+
+        assert collect_pipeline_results(pgconn) == [
+            pq.ExecStatus.COMMAND_OK,
+            pq.ExecStatus.COMMAND_OK,
+            pq.ExecStatus.PIPELINE_SYNC,
+        ]
+        pgconn.exit_pipeline_mode()
+
+        result = pgconn.exec_(b"SELECT 3")
+        assert result.status == pq.ExecStatus.TUPLES_OK
+        assert result.get_value(0, 0) == b"3"
 
 
 def test_statement_name_longer_than_pkt_buf(bouncer):
@@ -361,15 +445,14 @@ def test_prepared_statement_pipeline_error(bouncer):
         assert result == 1
 
     # Make sure queue is cleared after error
-    with bouncer.conn() as conn:
-        with conn.pipeline() as p, conn.cursor() as cur:
-            cur.execute("SELECT aaaa")
-            with pytest.raises(
-                psycopg.errors.UndefinedColumn, match='column "aaaa" does not exist'
-            ):
-                p.sync()
-            cur.execute(prepared_query, prepare=True)
-            assert cur.fetchall() == [(1,)]
+    with bouncer.conn() as conn, conn.pipeline() as p, conn.cursor() as cur:
+        cur.execute("SELECT aaaa")
+        with pytest.raises(
+            psycopg.errors.UndefinedColumn, match='column "aaaa" does not exist'
+        ):
+            p.sync()
+        cur.execute(prepared_query, prepare=True)
+        assert cur.fetchall() == [(1,)]
 
 
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
@@ -383,23 +466,22 @@ def test_prepared_statement_pipeline_error_delayed_sync(bouncer):
     # Make sure queue is fully cleared until Sync on error, even future
     # messages that have not yet been received by PgBouncer (including the Sync
     # itself)
-    with bouncer.conn() as conn:
-        with conn.pipeline() as p, conn.cursor() as cur:
-            cur.execute("SELECT aaaa")
-            time.sleep(0.1)
+    with bouncer.conn() as conn, conn.pipeline() as p, conn.cursor() as cur:
+        cur.execute("SELECT aaaa")
+        time.sleep(0.1)
 
-            with pytest.raises(
-                psycopg.errors.UndefinedColumn, match='column "aaaa" does not exist'
-            ):
-                cur.execute("SELECT 123")
+        with pytest.raises(
+            psycopg.errors.UndefinedColumn, match='column "aaaa" does not exist'
+        ):
+            cur.execute("SELECT 123")
 
-            with pytest.raises(psycopg.errors.PipelineAborted):
-                cur.fetchall()
+        with pytest.raises(psycopg.errors.PipelineAborted):
+            cur.fetchall()
 
-            p.sync()
+        p.sync()
 
-            cur.execute(prepared_query, prepare=True)
-            assert cur.fetchall() == [(1,)]
+        cur.execute(prepared_query, prepare=True)
+        assert cur.fetchall() == [(1,)]
 
 
 def test_prepared_failed_prepare(bouncer):
@@ -413,26 +495,25 @@ def test_prepared_failed_prepare(bouncer):
 
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 def test_prepared_failed_prepare_pipeline(bouncer):
-    with bouncer.conn() as conn:
-        with conn.pipeline() as p, conn.cursor() as cur:
-            cur.execute("SELECT 1", prepare=True)
-            cur.execute("SELECT * FROM doesnotexistyet", prepare=True)
-            with pytest.raises(psycopg.errors.UndefinedTable):
-                # Either of these two commands might fail due to timing
-                # differences, usually it's the sync. If the execute fails we
-                # still want it to sync though.
-                try:
-                    cur.execute("SELECT 2", prepare=True)
-                finally:
-                    p.sync()
-            cur.execute("SELECT 1", prepare=True)
-            p.sync()
-            cur.execute("SELECT 2", prepare=True)
-            p.sync()
-            cur.execute("CREATE TABLE doesnotexistyet (a int)")
-            cur.execute("SELECT * FROM doesnotexistyet", prepare=True)
-            p.sync()
-            cur.execute("DROP TABLE doesnotexistyet")
+    with bouncer.conn() as conn, conn.pipeline() as p, conn.cursor() as cur:
+        cur.execute("SELECT 1", prepare=True)
+        cur.execute("SELECT * FROM doesnotexistyet", prepare=True)
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            # Either of these two commands might fail due to timing
+            # differences, usually it's the sync. If the execute fails we
+            # still want it to sync though.
+            try:
+                cur.execute("SELECT 2", prepare=True)
+            finally:
+                p.sync()
+        cur.execute("SELECT 1", prepare=True)
+        p.sync()
+        cur.execute("SELECT 2", prepare=True)
+        p.sync()
+        cur.execute("CREATE TABLE doesnotexistyet (a int)")
+        cur.execute("SELECT * FROM doesnotexistyet", prepare=True)
+        p.sync()
+        cur.execute("DROP TABLE doesnotexistyet")
 
 
 def test_prepared_disallow_name_reuse(bouncer):
@@ -559,27 +640,25 @@ def test_pause_before_last_sync(bouncer):
 @pytest.mark.skipif("not USE_SUDO")
 @pytest.mark.skipif("not LIBPQ_SUPPORTS_PIPELINING")
 def test_prepared_statement_pipeline_latency(bouncer, pg):
-    with bouncer.conn() as conn1:
-        with conn1.pipeline() as p1:
-            with pg.add_latency():
-                start = time.time()
-                num_queries = 7
-                curs = [conn1.cursor() for _ in range(num_queries)]
-                for i in range(num_queries):
-                    curs[i].execute(f"SELECT '{i}'", prepare=True)
-                p1.sync()
+    with bouncer.conn() as conn1, conn1.pipeline() as p1, pg.add_latency():
+        start = time.time()
+        num_queries = 7
+        curs = [conn1.cursor() for _ in range(num_queries)]
+        for i in range(num_queries):
+            curs[i].execute(f"SELECT '{i}'", prepare=True)
+        p1.sync()
 
-                # Each query takes at least 1 second due to the latency
-                # introduced by the add_latency contextmanager. But because of
-                # pipelining the latency the whole series of queries should be
-                # a lot less.
-                end = time.time()
-                duration = end - start
-                assert duration < num_queries
+        # Each query takes at least 1 second due to the latency
+        # introduced by the add_latency contextmanager. But because of
+        # pipelining the latency the whole series of queries should be
+        # a lot less.
+        end = time.time()
+        duration = end - start
+        assert duration < num_queries
 
-                # The results should be correct too
-                for i in range(num_queries):
-                    assert curs[i].fetchone()[0] == str(i)
+        # The results should be correct too
+        for i in range(num_queries):
+            assert curs[i].fetchone()[0] == str(i)
 
 
 def test_prepared_statement_counters(bouncer):
@@ -611,23 +690,22 @@ def test_prepared_statement_counters(bouncer):
     # Explicitly enable prepared statement support
     bouncer.admin(f"set max_prepared_statements=10")
     prepared_query = "SELECT 1"
-    with bouncer.cur() as cur1:
-        with bouncer.cur() as cur2:
-            # prepare query on server 1 and client 1
-            cur1.execute(prepared_query, prepare=True)
-            # Run the prepared query twice on same server and client
+    with bouncer.cur() as cur1, bouncer.cur() as cur2:
+        # prepare query on server 1 and client 1
+        cur1.execute(prepared_query, prepare=True)
+        # Run the prepared query twice on same server and client
+        cur1.execute(prepared_query)
+        cur1.execute(prepared_query)
+        with cur2.connection.transaction():
+            # Claim server 1 with client 2
+            cur2.execute("SELECT 2")
+            # Client 1 now runs the prepared query, and it's automatically
+            # prepared on server 2
             cur1.execute(prepared_query)
-            cur1.execute(prepared_query)
-            with cur2.connection.transaction():
-                # Claim server 1 with client 2
-                cur2.execute("SELECT 2")
-                # Client 1 now runs the prepared query, and it's automatically
-                # prepared on server 2
-                cur1.execute(prepared_query)
-                # Client 2 now prepares the same query that was already
-                # prepared on server 1. And PgBouncer reuses that already
-                # prepared query for this different client.
-                cur2.execute(prepared_query, prepare=True)
+            # Client 2 now prepares the same query that was already
+            # prepared on server 1. And PgBouncer reuses that already
+            # prepared query for this different client.
+            cur2.execute(prepared_query, prepare=True)
 
     stats = bouncer.admin("SHOW STATS", row_factory=dict_row)
     p0_stats = next(s for s in stats if s["database"] == "p0")

@@ -102,14 +102,17 @@ const char * kill_pool_logins_server_error(PgPool *pool, PktHdr *errpkt)
 	const char *level, *sqlstate, *msg;
 
 	parse_server_error(errpkt, &level, &msg, &sqlstate);
-	log_warning("server login failed: %s %s", level, msg);
+	if (level != NULL && msg != NULL)
+		log_warning("server login failed: %s %s", level, msg);
+	else
+		log_warning("server login failed");
 
 	/*
 	 * Kill all waiting clients unless it's a temporary error, such as
 	 * "database system is starting up".
 	 */
-	if (strcmp(sqlstate, ERRCODE_CANNOT_CONNECT_NOW) != 0) {
-		log_noise("kill_pool_logins_server_error: sqlstate: %s", sqlstate);
+	if (sqlstate == NULL || strcmp(sqlstate, ERRCODE_CANNOT_CONNECT_NOW) != 0) {
+		log_noise("kill_pool_logins_server_error: sqlstate: %s", sqlstate ? sqlstate : "NULL");
 		kill_pool_logins(pool, sqlstate, msg);
 	}
 	return msg;
@@ -124,8 +127,26 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
 	const uint8_t *ckey;
 
 	if (incomplete_pkt(pkt)) {
-		disconnect_server(server, true, "partial pkt in login phase");
-		return false;
+		if (pkt->len > (unsigned) cf_sbuf_len) {
+			/*
+			 * We need to handle the complete packet, but it is too
+			 * large to fit into our sbuf buffer size (determined
+			 * by the pkt_buf config). So now we need to fetch the
+			 * whole packet using our dynamically sized packet
+			 * buffering logic.
+			 */
+			server->packet_cb_state.flag = CB_WANT_COMPLETE_PACKET;
+			sbuf_prepare_fetch(sbuf, pkt->len);
+			return true;
+		} else {
+			/*
+			 * We need to handle the complete packet, but it fits
+			 * in our sbuf buffer, so we can simply return false to
+			 * indicate to sbuf to retry once it has received more
+			 * data
+			 */
+			return false;
+		}
 	}
 
 	/* ignore most that happens during connect_query */
@@ -212,10 +233,6 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
 
 		/* need to notify sbuf if server was closed */
 		res = release_server(server);
-
-		/* let the takeover process handle it */
-		if (res && server->pool->db->admin)
-			res = takeover_login(server);
 		break;
 
 	/* ignorable packets */
@@ -235,8 +252,9 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
 		break;
 	}
 
-	if (res)
+	if (res && server->packet_cb_state.flag != CB_HANDLE_COMPLETE_PACKET) {
 		sbuf_prepare_skip(sbuf, pkt->len);
+	}
 
 	return res;
 }
@@ -352,6 +370,46 @@ int user_client_max_connections(PgGlobalUser *user)
 		return user->max_user_client_connections;
 }
 
+/*
+ * Send the responses that PgBouncer makes itself (RA_FAKE).
+ *
+ * Send them when all earlier requests have an answer. That is after each
+ * server packet, forwarded or skipped. A skipped packet sends no data to the
+ * client, so a delay here puts the fake response after a later real response.
+ *
+ * Returns false if the client and the server were disconnected.
+ */
+static bool send_pending_fake_responses(PgSocket *server, PgSocket *client)
+{
+	struct List *item, *tmp;
+
+	statlist_for_each_safe(item, &server->outstanding_requests, tmp) {
+		OutstandingRequest *request = container_of(item, OutstandingRequest, node);
+		if (request->action != RA_FAKE)
+			break;
+
+		statlist_pop(&server->outstanding_requests);
+		server->sbuf.extra_packet_queue_after = true;
+
+		if (!queue_fake_response(client, request->type)) {
+			/*
+			 * The only reason the above could have failed is because
+			 * of allocation errors. To actually be able to retry after
+			 * these failures the next round we would need to restore
+			 * the outstanding_requests queue to how it was before.
+			 * Instead of doing that, we take the easy and known
+			 * correct way out: Simply disconnecting the involved
+			 * client and server.
+			 */
+			disconnect_client(client, true, "out of memory");
+			disconnect_server(client->link, true, "out of memory");
+			return false;
+		}
+		slab_free(outstanding_request_cache, request);
+	}
+	return true;
+}
+
 /* process packets on logged in connection */
 static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 {
@@ -361,7 +419,6 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 	SBuf *sbuf = &server->sbuf;
 	PgSocket *client = server->link;
 	bool async_response = false;
-	struct List *item, *tmp;
 	bool ignore_packet = false;
 
 	Assert(!server->pool->db->admin);
@@ -515,6 +572,8 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 	case PqMsg_CopyBothResponse:
 		slog_debug(server, "COPY started");
 		server->copy_mode = true;
+		if (client)
+			client->copy_mode = true;
 		break;
 	case PqMsg_CopyOutResponse:
 		break;
@@ -560,6 +619,10 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 		} else if (ignore_packet) {
 			slog_noise(server, "not forwarding packet with type '%c' from server", pkt->type);
 			sbuf_prepare_skip(sbuf, pkt->len);
+
+			/* Flush the fake responses at the head of the queue. */
+			if (!send_pending_fake_responses(server, client))
+				return false;
 		} else {
 			sbuf_prepare_send(sbuf, &client->sbuf, pkt->len);
 
@@ -600,36 +663,12 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
 						server->pool->stats.xact_time += total;
 						slog_debug(client, "transaction time: %d us", (int)total);
 					} else if (!async_response) {
-						/* XXX This happens during takeover if the new process
-						 * continues a transaction. */
 						slog_warning(client, "FIXME: transaction end, but xact_start == 0");
 					}
 				}
 			}
-			statlist_for_each_safe(item, &server->outstanding_requests, tmp) {
-				OutstandingRequest *request = container_of(item, OutstandingRequest, node);
-				if (request->action != RA_FAKE)
-					break;
-
-				statlist_pop(&server->outstanding_requests);
-				sbuf->extra_packet_queue_after = true;
-
-				if (!queue_fake_response(client, request->type)) {
-					/*
-					 * The only reason the above could have failed is because
-					 * of allocation errors. To actually be able to retry after
-					 * these failures the next round we would need to restore
-					 * the outstanding_requests queue to how it was before.
-					 * Instead of doing that, we take the easy and known
-					 * correct way out: Simply disconnecting the involved
-					 * client and server.
-					 */
-					disconnect_client(client, true, "out of memory");
-					disconnect_server(client->link, true, "out of memory");
-					return false;
-				}
-				slab_free(outstanding_request_cache, request);
-			}
+			if (!send_pending_fake_responses(server, client))
+				return false;
 		}
 	} else {
 		if (server->state != SV_TESTED) {
@@ -691,7 +730,7 @@ static bool handle_connect(PgSocket *server)
 				server->wait_sslchar = true;
 		} else {
 			slog_noise(server, "P: startup");
-			res = send_startup_packet(server);
+			res = send_startup_message(server);
 		}
 		if (!res)
 			disconnect_server(server, false, "startup pkt failed");
@@ -730,7 +769,7 @@ static bool handle_sslchar(PgSocket *server, struct MBuf *data)
 		return false;
 	} else {
 		/* proceed with non-TLS connection */
-		ok = send_startup_packet(server);
+		ok = send_startup_message(server);
 	}
 
 	if (ok) {
@@ -741,12 +780,20 @@ static bool handle_sslchar(PgSocket *server, struct MBuf *data)
 	return ok;
 }
 
+/* dispatch a fully buffered packet, see process_pkt_callback() */
+static bool server_handle_complete_packet(PgSocket *server, PktHdr *pkt)
+{
+	pkt_rewind_v3(pkt);
+	if (server->state == SV_LOGIN)
+		return handle_server_startup(server, pkt);
+	return handle_server_work(server, pkt);
+}
+
 /* callback from SBuf */
 bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
 {
 	bool res = false;
 	PgSocket *server = container_of(sbuf, PgSocket, sbuf);
-	PgPool *pool = server->pool;
 	PktHdr pkt;
 	char infobuf[96];
 
@@ -848,6 +895,18 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
 				if (server->link) {
 					if (statlist_count(&server->outstanding_requests) > 0)
 						break;
+					/*
+					 * Client still in COPY-in stream (hasn't sent
+					 * CopyDone/CopyFail yet).  PostgreSQL sent
+					 * ReadyForQuery before entering pq_endcopyin
+					 * drain, so the drain loop is still consuming
+					 * CopyData from the client.  Stay linked so the
+					 * remaining CopyData + CopyDone can reach the
+					 * server; release will happen once copy_mode
+					 * clears after CopyDone.
+					 */
+					if (server->link->copy_mode)
+						break;
 				}
 
 				/* retval does not matter here */
@@ -862,7 +921,7 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
 		}
 		break;
 	case SBUF_EV_PKT_CALLBACK:
-		slog_warning(server, "SBUF_EV_PKT_CALLBACK with state=%d", server->state);
+		res = process_pkt_callback(server, data, server_handle_complete_packet);
 		break;
 	case SBUF_EV_TLS_READY:
 		Assert(server->state == SV_LOGIN);
@@ -875,14 +934,12 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
 		}
 
 		server->request_time = get_cached_time();
-		res = send_startup_packet(server);
+		res = send_startup_message(server);
 		if (res)
 			sbuf_continue(&server->sbuf);
 		else
 			disconnect_server(server, false, "TLS startup failed");
 		break;
 	}
-	if (!res && pool->db->admin)
-		takeover_login_failed();
 	return res;
 }

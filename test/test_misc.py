@@ -1,5 +1,7 @@
 import asyncio
 import re
+import socket
+import struct
 import threading
 import time
 
@@ -9,12 +11,101 @@ import pytest
 from .utils import (
     HAVE_IPV6_LOCALHOST,
     LINUX,
+    LONG_PASSWORD,
     PG_MAJOR_VERSION,
     PG_SUPPORTS_SCRAM,
     PKT_BUF_SIZE,
     USE_UNIX_SOCKETS,
     WINDOWS,
 )
+
+
+def test_login_notify_message_negative(bouncer):
+    """
+    Negative test for login_notify_message
+
+    Tests that NOTICE is not connection when login_notify_message is not set.
+    We are using psql here because psycopg does not seem to pick up notices that happen after
+    AuthenticationOk message and before ReadyForQuery.
+    """
+    config = f"""
+    [databases]
+    postgres = host={bouncer.pg.host} port={bouncer.pg.port}
+
+    [pgbouncer]
+    listen_addr = {bouncer.host}
+    admin_users = pgbouncer
+    auth_file = {bouncer.auth_path}
+    listen_port = {bouncer.port}
+    logfile = {bouncer.log_path}
+    pool_mode = session
+    """
+
+    with bouncer.run_with_config(config):
+        ret = bouncer.psql(
+            query="SELECT 1;", dbname="postgres", user="puser1", password="foo"
+        )
+        assert ret.stderr == b""
+        assert ret.stdout == b" ?column? \n----------\n        1\n(1 row)\n\n"
+
+
+def test_login_notify_message(bouncer):
+    """
+    Positive test for login_notify_message
+
+    Tests that NOTICE is correctly raised on connection when login_notify_message is set.
+    We are using psql here because psycopg does not seem to pick up notices that happen after
+    AuthenticationOk message and before ReadyForQuery.
+    """
+    config = f"""
+    [databases]
+    postgres = host={bouncer.pg.host} port={bouncer.pg.port}
+
+    [pgbouncer]
+    listen_addr = {bouncer.host}
+    admin_users = pgbouncer
+    auth_file = {bouncer.auth_path}
+    listen_port = {bouncer.port}
+    logfile = {bouncer.log_path}
+    pool_mode = session
+    login_notify_message = You are now connected to pgbouncer
+    """
+
+    with bouncer.run_with_config(config):
+        ret = bouncer.psql(
+            query="SELECT 1;", dbname="postgres", user="puser1", password="foo"
+        )
+        assert ret.stderr == b"NOTICE:  You are now connected to pgbouncer\n"
+        assert ret.stdout == b" ?column? \n----------\n        1\n(1 row)\n\n"
+
+
+@pytest.mark.parametrize(
+    "dbname,expected_pool_mode",
+    [
+        ["p6", "statement"],
+        ["p3", "session"],
+        ["p3x", "transaction"],
+    ],
+)
+def test_parameter_status(bouncer, dbname, expected_pool_mode):
+    """
+    Test that parameter_status messages `pgbouncer.version`, `pgbouncer.max_prepared_statements`
+    and `pgbouncer.pool_mode` are correctly sent to client when connecting to databases. We
+    test 3 different scenarios, one for each pool mode.
+    """
+    conn = bouncer.conn(dbname=dbname, user="postgres")
+    assert (
+        conn.pgconn.parameter_status(b"pgbouncer.version").decode()
+        == f"{bouncer.version()}"
+    )
+    assert (
+        conn.pgconn.parameter_status(b"pgbouncer.max_prepared_statements").decode()
+        == "200"
+    )
+    assert (
+        conn.pgconn.parameter_status(b"pgbouncer.pool_mode").decode()
+        == expected_pool_mode
+    )
 
 
 @pytest.mark.parametrize(
@@ -47,13 +138,15 @@ def test_scram_server(bouncer, test_auth_type):
     [users]
     puser1 = max_user_connections = 1
     """
-    with bouncer.run_with_config(config):
-        # good password from ini
-        with pytest.raises(psycopg.errors.ConnectionTimeout):
-            if test_auth_type == "trust":
-                bouncer.test(dbname="p6")
-            else:
-                bouncer.test(dbname="p6", password="foo", user="scramuser1")
+    # good password from ini
+    with (
+        bouncer.run_with_config(config),
+        pytest.raises(psycopg.errors.ConnectionTimeout),
+    ):
+        if test_auth_type == "trust":
+            bouncer.test(dbname="p6")
+        else:
+            bouncer.test(dbname="p6", password="foo", user="scramuser1")
 
 
 async def test_notify_queue_negative(bouncer):
@@ -84,7 +177,6 @@ async def test_notify_queue_negative(bouncer):
         notices_received.append(diag.message_primary)
 
     with bouncer.run_with_config(config):
-
         sleep_future = bouncer.asql(
             "SELECT pg_sleep(6)", dbname="postgres", user="puser1"
         )
@@ -95,7 +187,7 @@ async def test_notify_queue_negative(bouncer):
         )
         conn_2.add_notice_handler(log_notice)
         curr = await conn_2.execute("select 1;")
-        curr.fetchall()
+        await curr.fetchall()
 
         assert len(notices_received) == 0
 
@@ -105,10 +197,10 @@ async def test_notify_queue_negative(bouncer):
         _, sleep_future = await asyncio.wait([sleep_future], timeout=1)
 
         curr = await conn_2.execute("select 1;")
-        curr.fetchall()
+        await curr.fetchall()
         assert len(notices_received) == 0
 
-        conn_2.close()
+        await conn_2.close()
 
 
 async def test_notify_queue(bouncer):
@@ -141,7 +233,6 @@ async def test_notify_queue(bouncer):
         notices_received.append(diag.message_primary)
 
     with bouncer.run_with_config(config):
-
         sleep_future = bouncer.asql(
             "SELECT pg_sleep(6)", dbname="postgres", user="puser1"
         )
@@ -152,7 +243,7 @@ async def test_notify_queue(bouncer):
         )
         conn_2.add_notice_handler(log_notice)
         curr = await conn_2.execute("select 1;")
-        curr.fetchall()
+        await curr.fetchall()
 
         assert len(notices_received) == 1
         expected_message = (
@@ -166,11 +257,11 @@ async def test_notify_queue(bouncer):
         _, sleep_future = await asyncio.wait([sleep_future], timeout=1)
 
         curr = await conn_2.execute("select 1;")
-        curr.fetchall()
+        await curr.fetchall()
         assert len(notices_received) == 2
         assert expected_message == notices_received[1]
 
-        conn_2.close()
+        await conn_2.close()
 
 
 @pytest.mark.skipif("not LINUX", reason="socat proxy only available on linux")
@@ -212,9 +303,11 @@ def test_server_check_query_default_negative(pg, bouncer, proxy):
         pg.sql(f"SELECT pg_terminate_backend({pid});")
         proxy.start()
 
-        with bouncer.cur(dbname="postgres", user="puser1") as cur:
-            with pg.log_contains(" LOG:  statement: \n", times=0):
-                new_pid = cur.execute("SELECT pg_backend_pid()").fetchall()[0][0]
+        with (
+            bouncer.cur(dbname="postgres", user="puser1") as cur,
+            pg.log_contains(" LOG:  statement: \n", times=0),
+        ):
+            new_pid = cur.execute("SELECT pg_backend_pid()").fetchall()[0][0]
 
     assert new_pid != pid
     pg.configure(config="log_statement = 'none'")
@@ -260,9 +353,11 @@ def test_server_check_query_negative(pg, bouncer, proxy):
         pg.sql(f"SELECT pg_terminate_backend({pid});")
         proxy.start()
 
-        with bouncer.cur(dbname="postgres", user="puser1") as cur:
-            with pg.log_contains(" LOG:  statement: SELECT 2\n", times=0):
-                new_pid = cur.execute("SELECT pg_backend_pid()").fetchall()[0][0]
+        with (
+            bouncer.cur(dbname="postgres", user="puser1") as cur,
+            pg.log_contains(" LOG:  statement: SELECT 2\n", times=0),
+        ):
+            new_pid = cur.execute("SELECT pg_backend_pid()").fetchall()[0][0]
 
     assert new_pid != pid
     pg.configure(config="log_statement = 'none'")
@@ -303,9 +398,11 @@ def test_server_check_query_default(
         with bouncer.cur(dbname="postgres", user="puser1") as cur:
             pid = cur.execute("SELECT pg_backend_pid()").fetchall()[0][0]
 
-        with bouncer.cur(dbname="postgres", user="puser1") as cur:
-            with pg.log_contains(" LOG:  statement: \n", times=1):
-                new_pid = cur.execute("SELECT pg_backend_pid()").fetchall()[0][0]
+        with (
+            bouncer.cur(dbname="postgres", user="puser1") as cur,
+            pg.log_contains(" LOG:  statement: \n", times=1),
+        ):
+            new_pid = cur.execute("SELECT pg_backend_pid()").fetchall()[0][0]
 
     assert new_pid == pid
     pg.configure(config="log_statement = 'none'")
@@ -344,9 +441,11 @@ def test_server_check_query(pg, bouncer):
         with bouncer.cur(dbname="postgres", user="puser1") as cur:
             pid = cur.execute("SELECT pg_backend_pid()").fetchall()[0][0]
 
-        with bouncer.cur(dbname="postgres", user="puser1") as cur:
-            with pg.log_contains(" LOG:  statement: SELECT 2\n", times=1):
-                new_pid = cur.execute("SELECT pg_backend_pid()").fetchall()[0][0]
+        with (
+            bouncer.cur(dbname="postgres", user="puser1") as cur,
+            pg.log_contains(" LOG:  statement: SELECT 2\n", times=1),
+        ):
+            new_pid = cur.execute("SELECT pg_backend_pid()").fetchall()[0][0]
 
     assert new_pid == pid
     pg.configure(config="log_statement = 'none'")
@@ -378,9 +477,8 @@ def test_fast_close(bouncer):
 
 
 def test_track_extra_parameters(bouncer):
-    # test.ini has track_extra_parameters set to a list of Postgres
-    # parameters. Test that the parameters in the list in addition to the
-    # default hardcoded list of parameters are cached per client.
+    # Test that the default hardcoded list of tracked parameters are cached
+    # per client.
     bouncer.admin(f"set pool_mode=transaction")
 
     test_set = {
@@ -391,9 +489,6 @@ def test_track_extra_parameters(bouncer):
         "application_name": ["client1", "client2"],
     }
 
-    if not WINDOWS:
-        test_set["client_encoding"] = ["LATIN1", "LATIN5"]
-
     test_expected = {
         "intervalstyle": ["sql_standard", "postgres"],
         "standard_conforming_strings": ["on", "off"],
@@ -403,25 +498,46 @@ def test_track_extra_parameters(bouncer):
     }
 
     if not WINDOWS:
+        test_set["client_encoding"] = ["LATIN1", "LATIN5"]
         test_expected["client_encoding"] = ["LATIN1", "LATIN5"]
 
-    with bouncer.cur(dbname="p1") as cur1:
-        with bouncer.cur(dbname="p1") as cur2:
-            for key in test_set:
-                stmt1 = "SET " + key + " TO " + test_set[key][0]
-                stmt2 = "SET " + key + " TO " + test_set[key][1]
-                cur1.execute(stmt1)
-                cur2.execute(stmt2)
+    # default_transaction-read_only was not marked as GUC_REPORT until server version 14
+    if PG_MAJOR_VERSION >= 14:
+        test_set["default_transaction_read_only"] = ["true", "false"]
+        test_expected["default_transaction_read_only"] = ["on", "off"]
 
-                stmt = "SHOW " + key
-                cur1.execute(stmt)
-                cur2.execute(stmt)
+    # scram_iterations was not marked as GUC_REPORT until server version 16
+    if PG_MAJOR_VERSION >= 16:
+        test_set["scram_iterations"] = ["1000", "2000"]
+        test_expected["scram_iterations"] = ["1000", "2000"]
 
-                result1 = cur1.fetchone()
-                assert result1[0] == test_expected[key][0]
+    # search_path was not marked as GUC_REPORT until server version 18
+    if PG_MAJOR_VERSION >= 18:
+        test_set["search_path"] = ["a, b", "c, d"]
+        test_expected["search_path"] = ["a, b", "c, d"]
 
-                result2 = cur2.fetchone()
-                assert result2[0] == test_expected[key][1]
+    with bouncer.cur(dbname="p1") as cur1, bouncer.cur(dbname="p1") as cur2:
+        for key in test_set:
+            stmt1 = "SET " + key + " TO " + test_set[key][0]
+            stmt2 = "SET " + key + " TO " + test_set[key][1]
+            cur1.execute(stmt1)
+            cur2.execute(stmt2)
+
+            stmt = "SHOW " + key
+            cur1.execute(stmt)
+            cur2.execute(stmt)
+
+            result1 = cur1.fetchone()[0]
+            expected1 = test_expected[key][0]
+            assert result1 == expected1, (
+                f'parameter {key}, expected "{expected1}", got "{result1}"'
+            )
+
+            result2 = cur2.fetchone()[0]
+            expected2 = test_expected[key][1]
+            assert result2 == expected2, (
+                f'parameter {key}, expected "{expected2}", got "{result2}"'
+            )
 
 
 async def test_wait_close(bouncer):
@@ -460,9 +576,11 @@ def test_auto_database(bouncer):
 # non-empty.
 @pytest.mark.skipif("not HAVE_IPV6_LOCALHOST")
 async def test_host_list(bouncer):
-    with bouncer.log_contains(r"new connection to server \(from 127.0.0.1", times=1):
-        with bouncer.log_contains(r"new connection to server \(from \[::1\]", times=1):
-            await bouncer.asleep(1, dbname="hostlist1", times=2)
+    with (
+        bouncer.log_contains(r"new connection to server \(from 127.0.0.1", times=1),
+        bouncer.log_contains(r"new connection to server \(from \[::1\]", times=1),
+    ):
+        await bouncer.asleep(1, dbname="hostlist1", times=2)
 
 
 # This is the same test as above, except it doesn't use any IPv6
@@ -473,6 +591,93 @@ async def test_host_list(bouncer):
 async def test_host_list_dummy(bouncer):
     with bouncer.log_contains(r"new connection to server \(from 127.0.0.1", times=2):
         await bouncer.asleep(1, dbname="hostlist2", times=2)
+
+
+def _send_startup_message(bouncer, parameters):
+    payload = struct.pack("!I", 0x30000) + parameters
+
+    with socket.create_connection((bouncer.host, bouncer.port)) as sock:
+        sock.sendall(struct.pack("!I", len(payload) + 4) + payload)
+        with sock.makefile("rb") as stream:
+            message_type = stream.read(1)
+            message_length = struct.unpack("!I", stream.read(4))[0]
+            return message_type, stream.read(message_length - 4)
+
+
+def _startup_packet(user, database):
+    parameters = b"\0".join((b"user", user, b"database", database, b"", b""))
+    payload = struct.pack("!I", 0x30000) + parameters
+    return struct.pack("!I", len(payload) + 4) + payload
+
+
+def _read_message(stream):
+    message_type = stream.read(1)
+    message_length = struct.unpack("!I", stream.read(4))[0]
+    return message_type, stream.read(message_length - 4)
+
+
+@pytest.mark.parametrize("database", [b"p0", b"nonexistent_db"])
+def test_second_startup_message_rejected(bouncer, database):
+    # An unknown database doesn't get a pool, which used to let a second
+    # StartupMessage through and switch identity mid-authentication.
+    bouncer.admin("set auth_type = md5")
+
+    with socket.create_connection((bouncer.host, bouncer.port)) as sock:
+        sock.sendall(_startup_packet(b"puser1", database))
+        with sock.makefile("rb") as stream:
+            message_type, _ = _read_message(stream)
+            assert message_type == b"R"
+
+            with bouncer.log_contains("client re-sent startup pkt"):
+                sock.sendall(_startup_packet(b"pgbouncer", b"pgbouncer"))
+                message_type, message = _read_message(stream)
+            assert message_type == b"E"
+            assert b"client re-sent startup pkt" in message
+
+
+def test_protocol_extension_negotiation(bouncer):
+    protocol_version = 0x30000
+    extension = b"_pq_.test_protocol_negotiation"
+    parameters = (
+        b"\0".join(
+            (
+                b"user",
+                b"puser1",
+                b"database",
+                b"p0",
+                extension,
+                b"",
+                b"",
+            )
+        )
+        + b"\0"
+    )
+    message_type, message = _send_startup_message(bouncer, parameters)
+
+    assert message_type == b"v"
+    negotiated_version, extension_count = struct.unpack("!II", message[:8])
+    assert negotiated_version == protocol_version
+    assert extension_count == 1
+    assert message[8:] == extension + b"\0"
+
+    parameters = (
+        b"\0".join(
+            (
+                b"user",
+                b"puser1",
+                extension,
+                b"",
+                b"unsupported",
+                b"value",
+                b"",
+            )
+        )
+        + b"\0"
+    )
+    message_type, message = _send_startup_message(bouncer, parameters)
+
+    assert message_type == b"E"
+    assert b"unsupported startup parameter: unsupported\0" in message
 
 
 def test_options_startup_param(bouncer):
@@ -546,6 +751,13 @@ def test_options_startup_param(bouncer):
     ):
         bouncer.test(options="-c enable_seqscan=false")
 
+    # An option with an empty parameter name should be rejected.
+    with pytest.raises(
+        psycopg.OperationalError,
+        match="unsupported startup parameter in options:",
+    ):
+        bouncer.test(options="-c=")
+
     bouncer.admin("set ignore_startup_parameters = options")
     # Unsupported values should be ignored, so it shouldn't error but it should
     # have its default value instead.
@@ -567,8 +779,24 @@ def test_options_startup_param(bouncer):
         == "Europe/Lisbon"
     )
 
+    # The empty-parameter-name case must also not hang when "options" is in
+    # ignore_startup_parameters; here it is simply ignored rather than rejected.
+    bouncer.test(options="-c=")
 
-def test_startup_packet_larger_than_pktbuf(bouncer):
+
+def test_ignore_tracked_startup_parameter(bouncer):
+    """A parameter listed in ignore_startup_parameters is ignored, even if it's
+    one that PgBouncer tracks by default."""
+    default = bouncer.sql_value("SHOW search_path")
+    assert bouncer.sql_value("SHOW search_path", options="-c search_path=foo") == "foo"
+
+    bouncer.admin("set ignore_startup_parameters = search_path")
+    assert (
+        bouncer.sql_value("SHOW search_path", options="-c search_path=foo") == default
+    )
+
+
+def test_startup_message_larger_than_pktbuf(bouncer):
     long_string = "1" * PKT_BUF_SIZE
     bouncer.test(options=f"-c extra_float_digits={long_string}")
 
@@ -589,15 +817,35 @@ def test_equivalent_startup_param(bouncer):
     bouncer.admin("set verbose=2")
 
     canonical_expected_times = 1 if PG_MAJOR_VERSION >= 14 else 0
-    with bouncer.cur(options="-c DateStyle=ISO") as cur:
-        with bouncer.log_contains(
-            "varcache_apply: .*SET DateStyle='ISO'", times=1
-        ), bouncer.log_contains(
+    with (
+        bouncer.cur(options="-c DateStyle=ISO") as cur,
+        bouncer.log_contains("varcache_apply: .*SET DateStyle='ISO'", times=1),
+        bouncer.log_contains(
             "varcache_set_canonical: setting DateStyle to its canonical version ISO -> ISO, MDY",
             times=canonical_expected_times,
-        ):
-            cur.execute("SELECT 1")
-            cur.execute("SELECT 1")
+        ),
+    ):
+        cur.execute("SELECT 1")
+        cur.execute("SELECT 1")
+
+
+@pytest.mark.skipif(
+    "PG_MAJOR_VERSION < 14",
+    reason="default_transaction_read_only was not marked as GUC_REPORT before PG14",
+)
+def test_default_transaction_read_only(bouncer):
+    """
+    Test that "SET default_transaction_read_only = true" in one client connection
+    doesn't poison the pool with a read-only connection.
+    """
+    bouncer.admin(f"set pool_mode=transaction")
+
+    with bouncer.cur() as rocur:
+        rocur.execute("SET default_transaction_read_only = true")
+        assert rocur.execute("SHOW transaction_read_only").fetchone()[0] == "on"
+
+    with bouncer.cur() as rwcur:
+        assert rwcur.execute("SHOW transaction_read_only").fetchone()[0] == "off"
 
 
 @pytest.mark.skipif("WINDOWS", reason="Windows doesn't support sending SIGTERM")
@@ -607,7 +855,7 @@ async def test_repeated_sigterm(bouncer):
         bouncer.sigterm()
 
         # Single sigterm should wait for clients
-        time.sleep(1)
+        await asyncio.sleep(1)
         cur.execute("SELECT 1")
         assert bouncer.running()
 
@@ -630,7 +878,7 @@ async def test_repeated_sigint(bouncer):
         bouncer.sigint()
 
         # Single sigint should wait for servers to be released
-        time.sleep(1)
+        await asyncio.sleep(1)
         cur.execute("SELECT 1")
         assert bouncer.running()
 
@@ -658,9 +906,11 @@ def test_newly_paused_client_during_wait_for_servers_shutdown(bouncer):
         # Still in the same transaction, so this should work
         cur1.execute("SELECT 1")
         # New transaction so this should fail
-        with bouncer.log_contains(r"closing because: server shutting down"):
-            with pytest.raises(psycopg.OperationalError):
-                cur2.execute("SELECT 1")
+        with (
+            bouncer.log_contains(r"closing because: server shutting down"),
+            pytest.raises(psycopg.OperationalError),
+        ):
+            cur2.execute("SELECT 1")
 
 
 async def test_already_paused_client_during_wait_for_servers_shutdown(bouncer):
@@ -678,11 +928,18 @@ async def test_already_paused_client_during_wait_for_servers_shutdown(bouncer):
         done, pending = await asyncio.wait([task], timeout=3)
         assert done == set()
         assert pending == {task}
-        bouncer.admin("SHUTDOWN WAIT_FOR_SERVERS")
-        # Still in the same transaction, so this should work
-        cur1.execute("SELECT 1")
-        # New transaction so this should fail
+
+        # Unlike a client that's idle at shutdown, a client that's already
+        # waiting for a server is closed as a direct consequence of the
+        # SHUTDOWN command itself. So the log_contains needs to wrap the
+        # SHUTDOWN, not just the await of the failing task. Otherwise the
+        # "server shutting down" line can be written before log_contains seeks
+        # to the end of the log, causing it to be missed.
         with bouncer.log_contains(r"closing because: server shutting down"):
+            bouncer.admin("SHUTDOWN WAIT_FOR_SERVERS")
+            # Still in the same transaction, so this should work
+            cur1.execute("SELECT 1")
+            # New transaction so this should fail
             with pytest.raises(psycopg.OperationalError):
                 await task
 
@@ -809,3 +1066,108 @@ def test_issue_1104(bouncer):
 
         with bouncer.run_with_config(config):
             bouncer.admin("RELOAD")
+
+
+async def test_server_login_large_packets(bouncer):
+    """Test that server login works when packets exceed the small pkt_buf.
+
+    This tests the fix for handling large packets during server login phase
+    (handle_server_startup). By shrinking pkt_buf to a tiny value, normal
+    server login packets like ParameterStatus exceed the buffer and trigger
+    dynamic packet buffering.
+
+    pkt_buf is CF_NO_RELOAD, so it can only be changed by restarting pgbouncer
+    rather than with a RELOAD.
+    """
+    bouncer.write_ini("pkt_buf = 75")
+    await bouncer.restart()
+
+    # Simply connecting exercises the server login path: the server sends
+    # ParameterStatus, BackendKeyData, ReadyForQuery etc.
+    bouncer.test()
+
+
+async def test_unreported_param_startup(bouncer):
+    """Test that startup parameters tracked via track_extra_parameters are applied.
+
+    When track_extra_parameters includes a parameter that PostgreSQL does not report
+    via ParameterStatus (such as enable_seqscan), PgBouncer stores client->vars
+    from the startup options, but server->vars remains NULL. Consequently,
+    apply_var() must apply the variable when sval is NULL and reset it when a
+    client without the variable connects.
+    """
+    bouncer.write_ini("track_extra_parameters = enable_seqscan\ndefault_pool_size = 1")
+    await bouncer.restart()
+    bouncer.admin("set pool_mode=transaction")
+    bouncer.admin("set verbose=2")
+
+    # Client 1 sets enable_seqscan=off in startup options.
+    # It should emit SET enable_seqscan='off' only once across multiple transactions.
+    with (
+        bouncer.log_contains(r"varcache_apply: .*SET enable_seqscan='off'", times=1),
+        bouncer.cur(dbname="p1", options="-c enable_seqscan=off") as cur1,
+    ):
+        assert cur1.execute("SHOW enable_seqscan").fetchone()[0] == "off"
+        assert cur1.execute("SHOW enable_seqscan").fetchone()[0] == "off"
+
+    # Client 2 connects without startup options to the same pool (default_pool_size=1).
+    # The server connection should have enable_seqscan reset to DEFAULT ('on').
+    with (
+        bouncer.log_contains(r"varcache_apply: .*RESET enable_seqscan;", times=1),
+        bouncer.cur(dbname="p1") as cur2,
+    ):
+        assert cur2.execute("SHOW enable_seqscan").fetchone()[0] == "on"
+        assert cur2.execute("SHOW enable_seqscan").fetchone()[0] == "on"
+
+    # Client 1 connects again and should still have 'off' applied.
+    with (
+        bouncer.log_contains(r"varcache_apply: .*SET enable_seqscan='off'", times=1),
+        bouncer.cur(dbname="p1", options="-c enable_seqscan=off") as cur1,
+    ):
+        assert cur1.execute("SHOW enable_seqscan").fetchone()[0] == "off"
+
+
+async def test_session_authorization_tracked(bouncer):
+    """Test that SET SESSION AUTHORIZATION does not leak to other clients.
+
+    session_authorization is in the static list of tracked parameters. A
+    superuser client that changes it in transaction mode should get it
+    re-applied on every transaction, and other clients sharing the same server
+    connection should get it reset to the login user.
+    """
+    bouncer.write_ini("default_pool_size = 1")
+    await bouncer.restart()
+    bouncer.admin("set pool_mode=transaction")
+    bouncer.admin("set verbose=2")
+
+    conn_args = {
+        "dbname": "user_passthrough",
+        "user": "pswcheck",
+        "password": "pgbouncer-check",
+    }
+
+    with bouncer.cur(**conn_args) as cur1, bouncer.cur(**conn_args) as cur2:
+        assert cur1.execute("SHOW session_authorization").fetchone()[0] == "pswcheck"
+        assert cur2.execute("SHOW session_authorization").fetchone()[0] == "pswcheck"
+
+        cur1.execute("SET SESSION AUTHORIZATION someuser")
+        assert cur1.execute("SHOW session_authorization").fetchone()[0] == "someuser"
+
+        # cur2 shares the single server connection, so PgBouncer has to switch
+        # session_authorization back and forth between the two clients.
+        with bouncer.log_contains(
+            r"varcache_apply: .*SET session_authorization='pswcheck'", times=1
+        ):
+            assert (
+                cur2.execute("SHOW session_authorization").fetchone()[0] == "pswcheck"
+            )
+        with bouncer.log_contains(
+            r"varcache_apply: .*SET session_authorization='someuser'", times=1
+        ):
+            assert (
+                cur1.execute("SHOW session_authorization").fetchone()[0] == "someuser"
+            )
+
+        cur1.execute("RESET SESSION AUTHORIZATION")
+        assert cur1.execute("SHOW session_authorization").fetchone()[0] == "pswcheck"
+        assert cur2.execute("SHOW session_authorization").fetchone()[0] == "pswcheck"

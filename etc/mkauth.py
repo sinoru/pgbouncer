@@ -10,12 +10,14 @@ if len(sys.argv) != 3:
     print("usage: mkauth DSTFN CONNSTR")
     sys.exit(1)
 
-# read old file
+# read old file; interpret "-" as stdout
 fn = sys.argv[1]
-try:
-    old = open(fn, "r").read()
-except IOError:
-    old = ""
+if fn != "-":
+    try:
+        with open(fn) as fd:
+            old = fd.read()
+    except OSError:
+        old = ""
 
 # create new file data
 db = psycopg2.connect(sys.argv[2])
@@ -29,12 +31,14 @@ for user, psw in curs.fetchall():
     if not psw:
         psw = ""
     psw = psw.replace('"', '""')
-    lines.append('"%s" "%s"\n' % (user, psw))
+    lines.append('"{}" "{}"\n').format(user, psw)
 db.commit()
 cur = "".join(lines)
 
+if fn == "-":
+    sys.stdout.write(cur)
 # if changed, replace data securely
-if old != cur:
+elif old != cur:
     fd, tmpfn = tempfile.mkstemp(dir=os.path.split(fn)[0])
     f = os.fdopen(fd, "w")
     f.write(cur)
