@@ -20,98 +20,51 @@ on:
 
 permissions:
   contents: read
-  packages: write
-
-env:
-  DOCKER_IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        docker-platforms: ['linux/amd64', 'linux/arm64']
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: 'recursive'
-      - uses: docker/setup-qemu-action@v3
-        with:
-          platforms: ${{ matrix.docker-platforms }}
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
-        with:
-          registry: ghcr.io
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      output: image
+      push: ${{ github.event_name != 'pull_request' }}
+      platforms: |
+        linux/amd64
+        linux/arm64
+      cache: true
+      cache-mode: max
+      cache-scope: ${{ github.ref_name }}
+      set-meta-labels: true
+      # docker/metadata-action lowercases the image name (ghcr.io requires lowercase repository names)
+      meta-images: ghcr.io/${{ github.repository }}
+      meta-flavor: |
+        latest=auto
+      meta-tags: |
+        type=edge,branch=sinoru/main
+        type=edge,branch=sinoru/develop
+        type=semver,pattern={{raw}}
+        type=ref,event=pr
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ${{ env.DOCKER_IMAGE }}
-      - uses: docker/build-push-action@v5
-        id: build
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: ${{ matrix.docker-platforms }}
-          cache-from: type=gha,scope=$GITHUB_REF_NAME/${{ matrix.docker-platforms }}
-          cache-to: type=gha,scope=$GITHUB_REF_NAME/${{ matrix.docker-platforms }},mode=max
-          labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=${{ env.DOCKER_IMAGE }},push-by-digest=${{ github.event_name != 'pull_request' }},name-canonical=true,push=${{ github.event_name != 'pull_request' }}
-      - name: Export digest
-        id: digest
-        run: |
-          digest="${{ steps.build.outputs.digest }}"
-          echo "digest=${digest#sha256:}" >> $GITHUB_OUTPUT
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.digest.outputs.digest }}
-          path: /dev/null
-          compression-level: 0
-          overwrite: true
 
-  mix:
+  verify:
     if: github.event_name != 'pull_request'
     needs:
       - build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Create DIGESTS_PATH
-        run: |
-          export DIGESTS_PATH="$RUNNER_TEMP/$(uuidgen)/digests"
-          echo "DIGESTS_PATH=$DIGESTS_PATH" >>${GITHUB_ENV}
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: ${{ env.DIGESTS_PATH }}
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        if: github.event_name != 'pull_request'
-        with:
-          registry: ghcr.io
+    uses: docker/github-builder/.github/workflows/verify.yml@v1
+    permissions:
+      contents: read
+      packages: read
+    with:
+      builder-outputs: ${{ toJSON(needs.build.outputs) }}
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - run: echo "DOCKER_IMAGE=${DOCKER_IMAGE,,}" >>${GITHUB_ENV} # repository name must be lowercase
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ${{ env.DOCKER_IMAGE }}
-          flavor: |
-            latest=auto
-          tags: |
-            type=edge,branch=sinoru/main
-            type=edge,branch=sinoru/develop
-            type=semver,pattern={{raw}}
-            type=ref,event=pr
-      - name: Create manifest list and push
-        working-directory: ${{ env.DIGESTS_PATH }}
-        run: |
-          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.DOCKER_IMAGE }}@sha256:%s ' *)
-      - name: Inspect image
-        run: |
-          docker buildx imagetools inspect ${{ env.DOCKER_IMAGE }}:${{ steps.meta.outputs.version }}
