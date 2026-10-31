@@ -8,6 +8,21 @@ from psycopg.rows import dict_row
 from .utils import Bouncer, capture, run
 
 
+def test_parameter_status(bouncer):
+    """
+    Test that the admin console only sends the `pgbouncer.version` parameter
+    status and not `pgbouncer.max_prepared_statements` or
+    `pgbouncer.pool_mode`, since there is no real pool behind it.
+    """
+    conn = bouncer.admin_runner.conn()
+    assert (
+        conn.pgconn.parameter_status(b"pgbouncer.version").decode()
+        == f"{bouncer.version()}"
+    )
+    assert conn.pgconn.parameter_status(b"pgbouncer.max_prepared_statements") is None
+    assert conn.pgconn.parameter_status(b"pgbouncer.pool_mode") is None
+
+
 def test_reload_error(bouncer):
     """
     Test that admin console correctly raises error during RELOAD
@@ -40,15 +55,46 @@ def test_reload_error(bouncer):
             bouncer.admin("RELOAD")
 
 
+def test_show_user(bouncer):
+    """
+    Test `SHOW USERS` command.
+
+    Specifically we are trying to fix a bug where pool_size and reserve_pool_size
+    would take its value from the previous row if a pool_size was not set for a later
+    user. In this case test2's pool_size should not be impacted by test1's value.
+    """
+    config = f"""
+    [databases]
+    p1 = host={bouncer.pg.host} port={bouncer.pg.port}
+
+    [pgbouncer]
+    auth_file = {bouncer.auth_path}
+    auth_type = trust
+    auth_user = postgres
+    listen_addr = {bouncer.host}
+    listen_port = {bouncer.port}
+    admin_users = pgbouncer
+    pool_mode = session
+
+    [users]
+    test1 = pool_size=1 reserve_pool_size=1
+    test2 =
+    """
+
+    with bouncer.run_with_config(config):
+        users = bouncer.admin(f"SHOW USERS", row_factory=dict_row)
+        users = [user for user in users if user["name"] in ["test1", "test2"]]
+        assert ["1", ""] == [user["pool_size"].lstrip().rstrip() for user in users]
+        assert ["1", ""] == [
+            user["reserve_pool_size"].lstrip().rstrip() for user in users
+        ]
+
+
 def test_show(bouncer):
     show_items = [
         "clients",
         "config",
         "databases",
-        # Calling SHOW FDS on MacOS leaks the returned file descriptors to the
-        # python test runner. So we don't test this one directly. SHOW FDS is
-        # still tested indirectly by the takeover tests.
-        # "fds",
         "help",
         "lists",
         "peers",
@@ -72,6 +118,10 @@ def test_show(bouncer):
         bouncer.admin(f"SHOW {item}")
 
 
+def test_jdbc_extra_float_digits(bouncer):
+    bouncer.admin("SET extra_float_digits = 2")
+
+
 def test_socket_id(bouncer) -> None:
     """Test that PgSocket id is assigned as expected for sockets."""
     config = f"""
@@ -89,30 +139,30 @@ def test_socket_id(bouncer) -> None:
     server_lifetime = 0
     """
 
-    with bouncer.run_with_config(config):
-        with bouncer.cur(
+    with (
+        bouncer.run_with_config(config),
+        bouncer.cur(
             dbname="pgbouncer", user="pgbouncer", row_factory=dict_row
-        ) as admin_cursor:
-            admin_cursor.execute("SHOW SOCKETS")
-            servers = admin_cursor.fetchall()
-            initial_id = max([i["id"] for i in servers])
+        ) as admin_cursor,
+    ):
+        admin_cursor.execute("SHOW SOCKETS")
+        servers = admin_cursor.fetchall()
+        initial_id = max([i["id"] for i in servers])
 
-            for i in range(1, 4):
-                conn_2 = bouncer.conn(dbname="p1")
-                curr = conn_2.cursor()
-                _ = curr.execute("SELECT 1")
-                time.sleep(2)
-                clients = admin_cursor.execute("SHOW SOCKETS").fetchall()
-                assert len(clients) == 3
-                assert set(
-                    [
-                        initial_id,
-                        initial_id + i * 2 - 1,
-                        initial_id + i * 2,
-                    ]
-                ) == set([client["id"] for client in clients])
-                conn_2.close()
-                time.sleep(2)
+        for i in range(1, 4):
+            conn_2 = bouncer.conn(dbname="p1")
+            curr = conn_2.cursor()
+            _ = curr.execute("SELECT 1")
+            time.sleep(2)
+            clients = admin_cursor.execute("SHOW SOCKETS").fetchall()
+            assert len(clients) == 3
+            assert {
+                initial_id,
+                initial_id + i * 2 - 1,
+                initial_id + i * 2,
+            } == {client["id"] for client in clients}
+            conn_2.close()
+            time.sleep(2)
 
 
 def test_server_id(bouncer) -> None:
@@ -131,25 +181,27 @@ def test_server_id(bouncer) -> None:
     server_lifetime = 0
     """
 
-    with bouncer.run_with_config(config):
-        with bouncer.cur(
+    with (
+        bouncer.run_with_config(config),
+        bouncer.cur(
             dbname="pgbouncer", user="pgbouncer", row_factory=dict_row
-        ) as admin_cursor:
-            admin_cursor.execute("SHOW SOCKETS")
-            servers = admin_cursor.fetchall()
-            initial_id = max([i["id"] for i in servers])
+        ) as admin_cursor,
+    ):
+        admin_cursor.execute("SHOW SOCKETS")
+        servers = admin_cursor.fetchall()
+        initial_id = max([i["id"] for i in servers])
 
-            for i in range(1, 4):
-                conn_2 = bouncer.conn(dbname="p1")
-                curr = conn_2.cursor()
-                _ = curr.execute("SELECT 1")
-                time.sleep(2)
-                clients = admin_cursor.execute("SHOW SERVERS").fetchall()
-                assert [
-                    initial_id + i * 2,
-                ] == [client["id"] for client in clients]
-                conn_2.close()
-                time.sleep(2)
+        for i in range(1, 4):
+            conn_2 = bouncer.conn(dbname="p1")
+            curr = conn_2.cursor()
+            _ = curr.execute("SELECT 1")
+            time.sleep(2)
+            clients = admin_cursor.execute("SHOW SERVERS").fetchall()
+            assert [
+                initial_id + i * 2,
+            ] == [client["id"] for client in clients]
+            conn_2.close()
+            time.sleep(2)
 
 
 def test_client_id(bouncer) -> None:
@@ -182,11 +234,11 @@ def test_client_states(bouncer):
     conn_1 = bouncer.conn(dbname="p3x", user="clientstate")
 
     clients = bouncer.admin("SHOW CLIENTS", row_factory=dict_row)
-    client_id = [
+    client_id = next(
         client
         for client in clients
         if client["database"] == "p3x" and client["user"] == "clientstate"
-    ][0]["state"]
+    )["state"]
     assert client_id == "idle"
 
     cur_1 = conn_1.cursor()
@@ -211,11 +263,11 @@ def test_client_states(bouncer):
     time.sleep(1)
 
     clients = bouncer.admin("SHOW CLIENTS", row_factory=dict_row)
-    client_id = [
+    client_id = next(
         client
         for client in clients
         if client["database"] == "p3x" and client["user"] == "clientstate"
-    ][0]["state"]
+    )["state"]
     assert client_id == "waiting"
 
     bouncer.admin("RESUME p3x")
@@ -228,11 +280,11 @@ def test_client_states(bouncer):
     cur_1.execute("BEGIN; SELECT pg_sleep(5);")
 
     clients = bouncer.admin("SHOW CLIENTS", row_factory=dict_row)
-    client_id = [
+    client_id = next(
         client
         for client in clients
         if client["database"] == "p3x" and client["user"] == "clientstate"
-    ][0]["state"]
+    )["state"]
     assert client_id == "active"
 
     # Rollback/commit to end the long-running transaction
@@ -362,7 +414,7 @@ def test_kill_client(bouncer):
     assert len(clients) == 2
 
     # Get clients id
-    client_id = [client for client in clients if client["database"] == "p0"][0]["id"]
+    client_id = next(client for client in clients if client["database"] == "p0")["id"]
 
     # Issue kill client command
     clients = bouncer.admin(f"KILL_CLIENT {client_id}")
@@ -410,6 +462,7 @@ def test_show_stats(bouncer):
     assert p3_stats is not None
     # 5 connection attempts (and thus assignments)
     assert p3_stats["total_server_assignment_count"] == 5
+    assert p3_stats["total_client_login_count"] == 5
     # 4 autocommit queries + 2 transactions
     assert p3_stats["total_xact_count"] == 6
     # 11 SELECT 1 + 2 times COMMIT and ROLLBACK
@@ -420,15 +473,28 @@ def test_show_stats(bouncer):
     assert p3_stats is not None
     # 5 connection attempts (and thus assignments)
     assert p3_stats["server_assignment_count"] == 5
+    assert p3_stats["client_login_count"] == 5
     # 4 autocommit queries + 2 transactions
     assert p3_stats["xact_count"] == 6
     # 11 SELECT 1 + 2 times COMMIT and ROLLBACK
     assert p3_stats["query_count"] == 15
 
     totals = bouncer.admin("SHOW TOTALS")
-    # 5 connection attempts (and thus assignments)
+    # 5 p3 connection attempts (and thus assignments)
     assert ("total_server_assignment_count", 5) in totals
+    # 5 p3 connections + 3 admin connections from this test + 1 admin connection from Bouncer.wait_until_running()
+    assert ("total_client_login_count", 9) in totals
     # 4 autocommit queries + 2 transactions + 4 admin commands
     assert ("total_xact_count", 10) in totals
     # 11 SELECT 1 + 2 times COMMIT and ROLLBACK + 4 admin commands
     assert ("total_query_count", 19) in totals
+
+
+def test_show_config_alpha_order(bouncer):
+    """
+    Test validates that the contents of SHOW CONFIG appear in sorted order by key
+    per comment in src/main.c.
+    """
+    config = bouncer.admin("SHOW CONFIG", row_factory=dict_row)
+    config_keys = [i["key"] for i in config]
+    assert sorted(config_keys) == config_keys

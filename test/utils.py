@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import subprocess
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -36,7 +38,7 @@ BOUNCER_INI = TEST_DIR / "test.ini"
 BOUNCER_AUTH = TEST_DIR / "userlist.txt"
 BOUNCER_PID = TEST_DIR / "test.pid"
 BOUNCER_PORT = 6667
-BOUNCER_EXE = TEST_DIR / "../pgbouncer"
+BOUNCER_EXE = os.environ.get("BOUNCER_EXE", TEST_DIR / "../pgbouncer")
 NEW_CA_SCRIPT = TEST_DIR / "ssl" / "newca.sh"
 NEW_SITE_SCRIPT = TEST_DIR / "ssl" / "newsite.sh"
 ENABLE_VALGRIND = bool(os.environ.get("ENABLE_VALGRIND"))
@@ -53,12 +55,23 @@ START_OPENLDAP_SCRIPT = TEST_DIR / "start_openldap_server.sh"
 if os.name == "nt":
     USE_UNIX_SOCKETS = False
     HAVE_GETPEEREID = False
+    WINDOWS = True
 
-    # psycopg only supports WindowsSelectorEventLoopPolicy
+    # psycopg only works with a SelectorEventLoop, but on Windows asyncio
+    # defaults to the ProactorEventLoop. Setting the policy changes the
+    # process-wide default loop type, which is what we need here: most of our
+    # tests are synchronous but pull in async fixtures (e.g. bouncer), and
+    # pytest-asyncio runs those fixtures on the default loop.
+    #
+    # pytest-asyncio's newer pytest_asyncio_loop_factories hook can't replace
+    # this: it only steers the loop for async *tests*, not for async fixtures
+    # used by sync tests, which is the bulk of our suite. The event loop policy
+    # machinery is deprecated in Python 3.14 and removed in 3.16, so this needs
+    # revisiting for 3.16; until then the DeprecationWarning is ignored via
+    # filterwarnings in pyproject.toml.
     from asyncio import WindowsSelectorEventLoopPolicy
 
     asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())
-    WINDOWS = True
 else:
     USE_UNIX_SOCKETS = True
     HAVE_GETPEEREID = True
@@ -183,21 +196,40 @@ PG_SUPPORTS_SCRAM = PG_MAJOR_VERSION >= 10
 LIBPQ_SUPPORTS_PIPELINING = psycopg.pq.version() >= 140000
 
 
-def get_ldap_support():
-    with open("../config.mak", encoding="utf-8") as f:
-        match = re.search(r"ldap_support = (\w+)", f.read())
+def get_build_feature(config_mak_key, meson_define):
+    """Detect whether pgbouncer was built with a certain feature enabled.
+
+    An autotools build records this in config.mak, a meson build in the
+    generated test_config.h header. For meson we assume the conventional
+    "build" directory name, since the tests have no way of knowing where
+    the build directory actually is.
+    """
+    meson_config = Path("../build/test_config.h")
+    if meson_config.exists():
+        return (
+            re.search(rf"#define {meson_define}\b", meson_config.read_text())
+            is not None
+        )
+    config_mak = Path("../config.mak")
+    if config_mak.exists():
+        match = re.search(rf"{config_mak_key} = (\w+)", config_mak.read_text())
         assert match is not None
         return match.group(1) == "yes"
+    raise FileNotFoundError(
+        "Could not find ../config.mak (autotools) or ../build/test_config.h (meson). "
+        "Configure the project first, and for meson use 'build' as the build directory."
+    )
+
+
+def get_ldap_support():
+    return get_build_feature("ldap_support", "HAVE_LDAP")
 
 
 LDAP_SUPPORT = get_ldap_support()
 
 
 def get_tls_support():
-    with open("../config.mak", encoding="utf-8") as f:
-        match = re.search(r"tls_support = (\w+)", f.read())
-        assert match is not None
-        return match.group(1) == "yes"
+    return get_build_feature("tls_support", "USUAL_LIBSSL_FOR_TLS")
 
 
 TLS_SUPPORT = get_tls_support()
@@ -212,6 +244,10 @@ PORT_LOWER_BOUND = 10200
 PORT_UPPER_BOUND = 32768
 
 next_port = PORT_LOWER_BOUND
+
+
+class UnsupportedPlatformError(Exception):
+    """Raised by a test helper that has no implementation for this OS."""
 
 
 def cleanup_test_leftovers(*nodes):
@@ -260,7 +296,7 @@ class PortLock:
                     s.bind(("127.0.0.1", next_port))
                     self.port = next_port
                     break
-                except Exception:
+                except OSError:
                     continue
 
     def release(self):
@@ -283,6 +319,7 @@ class QueryRunner:
         self.port = port
         self.default_db = "postgres"
         self.default_user = "postgres"
+        self.default_password: str | None = None
 
         # Used to track objects that we want to clean up at the end of a test
         self.subscriptions = set()
@@ -297,6 +334,9 @@ class QueryRunner:
         options.setdefault("user", self.default_user)
         options.setdefault("host", self.host)
         options.setdefault("port", self.port)
+        if self.default_password is not None:
+            options.setdefault("password", self.default_password)
+
         if ENABLE_VALGRIND:
             # If valgrind is enabled PgBouncer is a significantly slower to
             # respond to connection requests, so we wait a little longer.
@@ -339,12 +379,14 @@ class QueryRunner:
         The connection and the cursors automatically close once you leave the
         "with" block
         """
-        with self.conn(
-            autocommit=autocommit,
-            **kwargs,
-        ) as conn:
-            with conn.cursor() as cur:
-                yield cur
+        with (
+            self.conn(
+                autocommit=autocommit,
+                **kwargs,
+            ) as conn,
+            conn.cursor() as cur,
+        ):
+            yield cur
 
     @asynccontextmanager
     async def acur(self, **kwargs):
@@ -353,9 +395,8 @@ class QueryRunner:
         The connection and the cursors automatically close once you leave the
         "async with" block
         """
-        async with await self.aconn(**kwargs) as conn:
-            async with conn.cursor() as cur:
-                yield cur
+        async with await self.aconn(**kwargs) as conn, conn.cursor() as cur:
+            yield cur
 
     def sql(self, query, params=None, **kwargs):
         """Run an SQL query
@@ -394,7 +435,7 @@ class QueryRunner:
 
     async def asql_coroutine(
         self, query, params=None, **kwargs
-    ) -> typing.Optional[typing.List[typing.Any]]:
+    ) -> list[typing.Any] | None:
         async with self.acur(**kwargs) as cur:
             await cur.execute(query, params=params)
             if cur.pgresult and cur.pgresult.status in [
@@ -414,13 +455,24 @@ class QueryRunner:
         self.set_default_connection_options(kwargs)
         connect_options = " ".join([f"{k}={v}" for k, v in kwargs.items()])
 
-        run(["psql", f"port={self.port} {connect_options}", "-c", query], shell=False)
+        result = run(
+            ["psql", "-X", f"port={self.port} {connect_options}", "-c", query],
+            shell=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if WINDOWS:
+            # On Windows psql writes its output in text mode, turning every \n
+            # into \r\n. Normalize it so callers can compare against the plain
+            # \n form regardless of platform.
+            result.stdout = result.stdout.replace(b"\r\n", b"\n")
+            result.stderr = result.stderr.replace(b"\r\n", b"\n")
+        return result
 
     @contextmanager
     def transaction(self, **kwargs):
-        with self.cur(**kwargs) as cur:
-            with cur.connection.transaction():
-                yield cur
+        with self.cur(**kwargs) as cur, cur.connection.transaction():
+            yield cur
 
     def sleep(self, duration=3, **kwargs):
         """Run pg_sleep"""
@@ -514,7 +566,7 @@ class QueryRunner:
                     f"| pfctl -a pgbouncer_test/port_{self.port} -f -'"
                 )
             else:
-                raise Exception("This OS cannot run this test")
+                raise UnsupportedPlatformError("This OS cannot run this test")
             try:
                 yield
             finally:
@@ -549,7 +601,7 @@ class QueryRunner:
                     f"| pfctl -a pgbouncer_test/port_{self.port} -f -'"
                 )
             else:
-                raise Exception("This OS cannot run this test")
+                raise UnsupportedPlatformError("This OS cannot run this test")
             try:
                 yield
             finally:
@@ -569,7 +621,7 @@ class QueryRunner:
     def add_latency(self):
         """Adds one second of latency to all packets to this query runner"""
         if not LINUX:
-            raise Exception("This OS cannot run this test")
+            raise UnsupportedPlatformError("This OS cannot run this test")
         sudo(
             f"tc filter add dev lo parent 1:0 protocol ip prio {self.port} u32 match ip dport {self.port} 0xffff flowid 1:2"
         )
@@ -577,9 +629,8 @@ class QueryRunner:
             yield
         finally:
             sudo(f"tc filter del dev lo parent 1: prio {self.port}")
-            pass
 
-    def create_user(self, name, args: typing.Optional[psycopg.sql.Composable] = None):
+    def create_user(self, name, args: psycopg.sql.Composable | None = None):
         self.users.add(name)
         if args is None:
             args = sql.SQL("")
@@ -698,7 +749,7 @@ class Proxy(QueryRunner):
         self.pg = pg
         self.cursors = {}
         self.restarted = False
-        self.process: typing.Optional[subprocess.Popen] = None
+        self.process: subprocess.Popen | None = None
 
     def start(self):
         command = [
@@ -709,7 +760,12 @@ class Proxy(QueryRunner):
         self.process = subprocess.Popen(" ".join(command), shell=True)
 
     def stop(self):
+        if self.process is None:
+            return
+
         self.process.kill()
+        self.process.wait()
+        self.process = None
 
     def cleanup(self):
         self.stop()
@@ -938,8 +994,8 @@ class Bouncer(QueryRunner):
             self.port_lock = PortLock()
             super().__init__("127.0.0.1", self.port_lock.port)
 
-        self.process: typing.Optional[subprocess.Popen] = None
-        self.aprocess: typing.Optional[asyncio.subprocess.Process] = None
+        self.process: subprocess.Popen | None = None
+        self.aprocess: asyncio.subprocess.Process | None = None
         config_dir.mkdir()
         self.config_dir = config_dir
         self.ini_path = self.config_dir / "test.ini"
@@ -968,31 +1024,30 @@ class Bouncer(QueryRunner):
         self.admin_runner = QueryRunner(self.admin_host, self.port)
         self.admin_runner.default_db = "pgbouncer"
         self.admin_runner.default_user = "pgbouncer"
+        self.admin_runner.default_password = "fake"
 
-        with open(base_auth_path) as base_auth:
-            with self.auth_path.open("w") as auth:
-                auth.write(base_auth.read())
-                auth.write(f'"longpass" "{LONG_PASSWORD}"\n')
-                auth.flush()
+        with open(base_auth_path) as base_auth, self.auth_path.open("w") as auth:
+            auth.write(base_auth.read())
+            auth.write(f'"longpass" "{LONG_PASSWORD}"\n')
+            auth.flush()
 
-        with open(base_ini_path) as base_ini:
-            with self.ini_path.open("w") as ini:
-                ini.write(base_ini.read().replace("port=6666", f"port={pg.port}"))
-                ini.write("\n")
-                ini.write(f"logfile = {self.log_path}\n")
-                ini.write(f"auth_file = {self.auth_path}\n")
-                ini.write("pidfile = \n")
-                # Uncomment for much more noise but, more detailed debugging
-                # ini.write("verbose = 3\n")
+        with open(base_ini_path) as base_ini, self.ini_path.open("w") as ini:
+            ini.write(base_ini.read().replace("port=6666", f"port={pg.port}"))
+            ini.write("\n")
+            ini.write(f"logfile = {self.log_path}\n")
+            ini.write(f"auth_file = {self.auth_path}\n")
+            ini.write("pidfile = \n")
+            # Uncomment for much more noise but, more detailed debugging
+            # ini.write("verbose = 3\n")
 
-                if not USE_UNIX_SOCKETS:
-                    ini.write(f"unix_socket_dir = \n")
-                    ini.write(f"admin_users = pgbouncer\n")
-                else:
-                    ini.write(f"unix_socket_dir = {self.admin_host}\n")
-                ini.write(f"listen_port = {self.port}\n")
+            if not USE_UNIX_SOCKETS:
+                ini.write(f"unix_socket_dir = \n")
+                ini.write(f"admin_users = pgbouncer\n")
+            else:
+                ini.write(f"unix_socket_dir = {self.admin_host}\n")
+            ini.write(f"listen_port = {self.port}\n")
 
-                ini.flush()
+            ini.flush()
 
         with self.ini_path.open("r") as ini:
             self.original_ini_contents = ini.read()
@@ -1017,12 +1072,25 @@ class Bouncer(QueryRunner):
             ]
         return [str(BOUNCER_EXE)]
 
-    async def start(self):
-        # Due to using WindowsSelectorEventLoopPolicy for support with psycopg
-        # we cannot use asyncio subprocesses. Since this eventloop does not
-        # support it. We fall back to regular subprocesses.
+    def version(self):
+        p = subprocess.Popen(
+            [str(BOUNCER_EXE), "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        out, _ = p.communicate()
+        pgbouncer_version = out.decode().split("\n")[0].split(" ")[1]
         if WINDOWS:
-            self.process = subprocess.Popen(
+            pgbouncer_version = pgbouncer_version.split("\r")[0]
+        return pgbouncer_version
+
+    async def start(self):
+        # Due to using a SelectorEventLoop for support with psycopg we cannot
+        # use asyncio subprocesses, since that eventloop does not support them.
+        # We fall back to regular subprocesses.
+        if WINDOWS:
+            self.process = subprocess.Popen(  # noqa: ASYNC220
                 [*self.base_command(), "--quiet", self.ini_path], close_fds=True
             )
         else:
@@ -1041,7 +1109,7 @@ class Bouncer(QueryRunner):
                     self.print_logs()
                     raise
                 tries += 1
-                time.sleep(0.1)
+                await asyncio.sleep(0.1)
                 continue
             break
 
@@ -1091,38 +1159,14 @@ class Bouncer(QueryRunner):
 
         await self.wait_for_exit()
 
-    async def reboot(self):
-        """Starts a new PgBouncer with the --reboot flag
+    async def restart(self):
+        """Fully stops and starts PgBouncer again
 
-        This new PgBouncer process will replace the current process and take
-        over its non-SSL sockets.
+        This can be used to apply config changes that a RELOAD cannot (i.e.
+        CF_NO_RELOAD settings such as pkt_buf).
         """
-        assert self.aprocess is not None or self.process is not None
-        if self.aprocess:
-            old_process = self.aprocess
-            old_pid = old_process.pid
-            self.aprocess = await asyncio.create_subprocess_exec(
-                *self.base_command(),
-                "--reboot",
-                "--quiet",
-                str(self.ini_path),
-                close_fds=True,
-            )
-            await old_process.communicate()
-            await old_process.wait()
-            await self.wait_until_running()
-            assert self.aprocess.pid != old_pid
-        if self.process:
-            old_process = self.process
-            old_pid = old_process.pid
-            self.process = subprocess.Popen(
-                [*self.base_command(), "--reboot", "--quiet", self.ini_path],
-                close_fds=True,
-            )
-            old_process.communicate()
-            old_process.wait()
-            await self.wait_until_running()
-            assert self.process.pid != old_pid
+        await self.stop()
+        await self.start()
 
     def send_signal(self, sig):
         if self.aprocess:
@@ -1154,7 +1198,7 @@ class Bouncer(QueryRunner):
             with self.log_path.open() as f:
                 log_contents = f.read()
                 print(log_contents)
-        except Exception:
+        except (OSError, UnicodeDecodeError):
             pass
 
         # Most reliable way to detect Assert failures. Otherwise we might miss

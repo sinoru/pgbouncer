@@ -28,7 +28,7 @@ def test_max_db_client_connections_local_override_global(bouncer):
     connect_args = {"dbname": test_db, "user": "muser1"}
     conns = [bouncer.conn(**connect_args) for _ in range(2)]
     dbs = bouncer.admin("SHOW DATABASES", row_factory=dict_row)
-    db = [db for db in dbs if db["name"] == test_db][0]
+    db = next(db for db in dbs if db["name"] == test_db)
     assert db["current_client_connections"] == 2
     assert db["max_client_connections"] == 2
     with pytest.raises(psycopg.OperationalError, match=r"max_db_client_connections"):
@@ -60,7 +60,7 @@ def test_max_db_client_connections_global_negative(
     connect_args = {"dbname": test_db, "user": test_user}
     conns = [bouncer.conn(**connect_args) for _ in range(2)]
     dbs = bouncer.admin("SHOW DATABASES", row_factory=dict_row)
-    db = [db for db in dbs if db["name"] == test_db][0]
+    db = next(db for db in dbs if db["name"] == test_db)
     assert db["current_client_connections"] == 2 if test_db == "p0" else 3
     assert db["max_client_connections"] == 2
 
@@ -98,7 +98,7 @@ def test_max_db_client_connections_global_positive(
     conn = bouncer.conn(**connect_args)
     # should still be allowed, since it's the last allowed connection
     dbs = bouncer.admin("SHOW DATABASES", row_factory=dict_row)
-    db = [db for db in dbs if db["name"] == test_db][0]
+    db = next(db for db in dbs if db["name"] == test_db)
     assert db["current_client_connections"] == 1 if test_db == "p0" else 2
     assert db["max_client_connections"] == 2
     _ = bouncer.conn(**connect_args)
@@ -122,14 +122,14 @@ def test_max_db_client_connections_decrement(
     bouncer.admin("SET admin_users = 'pgbouncer'")
 
     connect_args = {"dbname": test_db, "user": test_user}
-    [conn_1, conn_2] = [bouncer.conn(**connect_args) for _ in range(2)]
+    [_conn_1, conn_2] = [bouncer.conn(**connect_args) for _ in range(2)]
     dbs = bouncer.admin("SHOW DATABASES", row_factory=dict_row)
-    db = [db for db in dbs if db["name"] == test_db][0]
+    db = next(db for db in dbs if db["name"] == test_db)
     assert db["current_client_connections"] == 2 if test_db == "p0" else 3
 
     conn_2.close()
     dbs = bouncer.admin("SHOW DATABASES", row_factory=dict_row)
-    db = [db for db in dbs if db["name"] == test_db][0]
+    db = next(db for db in dbs if db["name"] == test_db)
     assert db["current_client_connections"] == 1 if test_db == "p0" else 2
 
 
@@ -148,7 +148,7 @@ def test_max_db_client_connections_negative(
     # with bouncer.run_with_config(config):
     conns = [bouncer.conn(**connect_args) for _ in range(2)]
     dbs = bouncer.admin("SHOW DATABASES", row_factory=dict_row)
-    db = [db for db in dbs if db["name"] == test_db][0]
+    db = next(db for db in dbs if db["name"] == test_db)
     assert db["current_client_connections"] == 2 if test_db == "p0" else 3
     assert db["max_client_connections"] == 2
 
@@ -173,7 +173,7 @@ def test_max_db_client_connections_positive(bouncer, test_db: str, test_user) ->
     conn = bouncer.conn(**connect_args)
     # should still be allowed, since it's the last allowed connection
     dbs = bouncer.admin("SHOW DATABASES", row_factory=dict_row)
-    db = [db for db in dbs if db["name"] == test_db][0]
+    db = next(db for db in dbs if db["name"] == test_db)
     assert db["current_client_connections"] == 1 if test_db == "p0" else 2
     assert db["max_client_connections"] == 2
     _ = bouncer.conn(**connect_args)
@@ -496,9 +496,11 @@ def test_min_pool_size_with_lower_max_user_connections(bouncer):
 
     # Running a query for sufficient time for us to reach the final
     # connection count in the pool and detect any evictions.
-    with bouncer.log_contains(r"new connection to server \(from", times=2):
-        with bouncer.log_contains("closing because: evicted", times=0):
-            bouncer.sleep(2, dbname="p0x", user="maxedout2")
+    with (
+        bouncer.log_contains(r"new connection to server \(from", times=2),
+        bouncer.log_contains("closing because: evicted", times=0),
+    ):
+        bouncer.sleep(2, dbname="p0x", user="maxedout2")
 
 
 def test_min_pool_size_with_lower_max_db_connections(bouncer):
@@ -509,9 +511,11 @@ def test_min_pool_size_with_lower_max_db_connections(bouncer):
 
     # Running a query for sufficient time for us to reach the final
     # connection count in the pool and detect any evictions.
-    with bouncer.log_contains(r"new connection to server \(from", times=2):
-        with bouncer.log_contains("closing because: evicted", times=0):
-            bouncer.sleep(2, dbname="p0y", user="puser1")
+    with (
+        bouncer.log_contains(r"new connection to server \(from", times=2),
+        bouncer.log_contains("closing because: evicted", times=0),
+    ):
+        bouncer.sleep(2, dbname="p0y", user="puser1")
 
 
 async def test_reserve_pool_size(pg, bouncer):
@@ -591,10 +595,13 @@ async def test_max_db_connections(pg, bouncer):
     # some users, doesn't matter which ones
     users = ["muser1", "muser2", "puser1", "puser2", "postgres"]
 
-    # p2 has max_db_connections=4
-    await asyncio.gather(
-        *[bouncer.asleep(0.5, dbname="p2", user=u, times=2) for u in users]
-    )
+    # p2 has max_db_connections=4, so the five pools have to take connections
+    # off each other to get all their clients served, and the log should name
+    # the limit that made them do it.
+    with bouncer.log_contains(r"closing because: evicted for max_db_connections \(age"):
+        await asyncio.gather(
+            *[bouncer.asleep(0.5, dbname="p2", user=u, times=2) for u in users]
+        )
 
     # p2 in PgBouncer maps to p0 in Postgres
     assert pg.connection_count("p0", users=users) == 4
@@ -612,3 +619,24 @@ async def test_max_user_connections(pg, bouncer):
     )
 
     assert pg.connection_count("p7", users=["maxedout"]) == 3
+
+
+async def test_max_user_connections_eviction(pg, bouncer):
+    # maxedout has max_user_connections=3. Three concurrent clients on p7a need
+    # three servers, which uses up the user's whole budget and leaves those
+    # servers idle afterwards. A client on p7b, a separate pool over the same
+    # Postgres database, then has no way in except by evicting one of them,
+    # and one is all it needs.
+    #
+    # This is done in two steps on purpose. With clients on several pools at
+    # once, a pool that gets its server before anyone else needs it never has
+    # to evict, so whether an eviction happens at all depends on timing.
+    await bouncer.asleep(
+        0.5, dbname="p7a", user="maxedout", times=3, connect_timeout=10
+    )
+    assert pg.connection_count("p7", users=["maxedout"]) == 3
+
+    with bouncer.log_contains(
+        r"closing because: evicted for max_user_connections \(age", times=1
+    ):
+        bouncer.test(dbname="p7b", user="maxedout", connect_timeout=10)

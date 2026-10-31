@@ -48,6 +48,7 @@ AC_SUBST(PORTNAME)
 AC_MSG_RESULT([$PORTNAME])
 dnl Set the flags before any feature tests.
 if test "$PORTNAME" = "win32"; then
+  AC_DEFINE([_POSIX_C_SOURCE], [1], [Define before including <time.h> for getting localtime_r() etc. on MinGW.])
   AC_DEFINE([WIN32_LEAN_AND_MEAN], [1], [Define to request cleaner win32 headers.])
   AC_DEFINE([WINVER], [0x0600], [Define to max win32 API version (0x0600=Vista).])
 fi
@@ -64,11 +65,69 @@ dnl Old name for initial checks
 AC_DEFUN([AC_USUAL_PORT_CHECK], [AC_USUAL_INIT])
 
 dnl
+dnl AC_USUAL_C11:  Make sure the compiler builds in C11 mode.
+dnl
+dnl Autoconf 2.70+ makes AC_PROG_CC select a C11-enabling flag on its own, but
+dnl we still support the Autoconf 2.69 shipped by distributions such as Rocky
+dnl Linux and Debian Bullseye, where AC_PROG_CC leaves the compiler in its
+dnl default (often pre-C11) mode.  So detect the flag ourselves.  We only add a
+dnl -std= flag when the compiler does not already accept C11 by default, to
+dnl avoid overriding a newer default (e.g. gnu17) unnecessarily.
+dnl
+AC_DEFUN([AC_USUAL_C11], [
+AC_MSG_CHECKING([for C11 support])
+ac_usual_c11=no
+for ac_usual_c11_flag in '' '-std=gnu11' '-std=c11'; do
+  ac_usual_c11_save_CFLAGS="$CFLAGS"
+  CFLAGS="$CFLAGS $ac_usual_c11_flag"
+  dnl Require a genuine C11 mode, not just the underlying keywords.  GCC
+  dnl accepts _Static_assert/_Alignof/_Generic as extensions even in pre-C11
+  dnl modes (only warning, so a -c compile still succeeds), while glibc gates
+  dnl the <assert.h>/<stdalign.h> macros the code actually uses (static_assert,
+  dnl alignof) on __STDC_VERSION__ >= 201112L.  So key the check off that macro
+  dnl and also exercise the library macros themselves.
+  AC_COMPILE_IFELSE([AC_LANG_PROGRAM(
+    [[#include <assert.h>
+      #include <stdalign.h>
+      #if __STDC_VERSION__ < 201112L
+      #error "C11 mode is not enabled"
+      #endif
+      static_assert(1, "static assertions work");
+      _Noreturn void ac_usual_noret(void);
+      _Noreturn void ac_usual_noret(void) { for (;;) {} }]],
+    [[int x = 0;
+      int g = _Generic(x, int: 1, default: 0);
+      int a = (int) alignof(int);
+      return g + a - g - a;]])],
+    [ac_usual_c11=yes])
+  CFLAGS="$ac_usual_c11_save_CFLAGS"
+  if test "$ac_usual_c11" = yes; then
+    test -n "$ac_usual_c11_flag" && CFLAGS="$CFLAGS $ac_usual_c11_flag"
+    break
+  fi
+done
+if test "$ac_usual_c11" = yes; then
+  if test -n "$ac_usual_c11_flag"; then
+    AC_MSG_RESULT([yes ($ac_usual_c11_flag)])
+  else
+    AC_MSG_RESULT([yes])
+  fi
+else
+  AC_MSG_RESULT([no])
+  AC_MSG_ERROR([a C11-capable compiler is required to build this software])
+fi
+])
+
+dnl
 dnl AC_USUAL_PROGRAM_CHECK:  Simple C environment: CC, CPP, INSTALL
 dnl
 AC_DEFUN([AC_USUAL_PROGRAM_CHECK], [
-AC_PROG_CC_STDC
+dnl AC_REQUIRE, not a direct call: under Autoconf 2.73 a direct AC_PROG_CC
+dnl here expands the compiler detection a second time, and the hoisted first
+dnl expansion loses the OBJEXT probe, leaving CFLAGS and WFLAGS empty.
+AC_REQUIRE([AC_PROG_CC])
 AC_PROG_CPP
+AC_USUAL_C11
 
 dnl Check if linker supports -Wl,--as-needed
 if test "$GCC" = "yes"; then
@@ -166,7 +225,6 @@ dnl
 dnl AC_USUAL_TYPE_CHECK: Basic types for C
 dnl
 AC_DEFUN([AC_USUAL_TYPE_CHECK], [
-AC_C_RESTRICT
 AC_C_BIGENDIAN
 AC_SYS_LARGEFILE
 AC_TYPE_PID_T
@@ -203,7 +261,7 @@ dnl
 AC_DEFUN([AC_USUAL_FUNCTION_CHECK], [
 ### Functions provided if missing
 dnl AC_CHECK_FUNCS(basename dirname) # unstable, provide always
-AC_CHECK_FUNCS(strlcpy strlcat strnlen strsep getpeereid sigaction sigqueue)
+AC_CHECK_FUNCS(strlcpy strlcat strsep getpeereid sigaction sigqueue)
 AC_CHECK_FUNCS(memmem memrchr mempcpy)
 AC_CHECK_FUNCS(inet_ntop inet_pton poll getline regcomp)
 AC_CHECK_FUNCS(err errx warn warnx getprogname setprogname)
@@ -213,7 +271,7 @@ AC_CHECK_FUNCS(fls flsl flsll ffs ffsl ffsll)
 AC_CHECK_FUNCS(fnmatch mbsnrtowcs nl_langinfo strtod_l strtonum)
 AC_CHECK_FUNCS(asprintf vasprintf timegm)
 ### Functions provided only on win32
-AC_CHECK_FUNCS(localtime_r gettimeofday recvmsg sendmsg usleep getrusage)
+AC_CHECK_FUNCS(gettimeofday recvmsg sendmsg usleep getrusage)
 ### Functions used by libusual itself
 AC_CHECK_FUNCS(syslog mmap getpeerucred arc4random_buf getentropy getrandom)
 ### win32: link with ws2_32

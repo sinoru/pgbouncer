@@ -134,7 +134,7 @@ bool pg_md5_encrypt(const char *part1,
 	hash2hex(hash, dest + 3);
 	return true;
 failed:
-	log_error("MD5 authentication failed: %s", ERR_reason_error_string(ERR_get_error()));
+	log_error("MD5 authentication failed: %s", ERR_error_string(ERR_get_error(), NULL));
 	EVP_MD_CTX_destroy(mdctx);
 	return false;
 #else
@@ -244,6 +244,13 @@ bool strlist_contains(const char *liststr, const char *str)
 {
 	int c, len = strlen(str);
 	const char *p, *listpos = liststr;
+
+	/*
+	 * An empty string is never a member of the list.  Besides being the
+	 * correct answer, this also avoids an infinite loop below.
+	 */
+	if (len == 0)
+		return false;
 
 loop:
 	/* find string fragment, later check if actual token */
